@@ -15,7 +15,7 @@
         android:paddingBottom="32dp">
 
         <!-- App Info Card -->
-        <androidx.cardview.widget.CardView
+        <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             app:cardCornerRadius="12dp"
@@ -57,10 +57,10 @@
                 </LinearLayout>
 
             </LinearLayout>
-        </androidx.cardview.widget.CardView>
+        </com.google.android.material.card.MaterialCardView>
 
         <!-- Status Card -->
-        <androidx.cardview.widget.CardView
+        <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             app:cardCornerRadius="12dp"
@@ -118,10 +118,10 @@
                 </LinearLayout>
 
             </LinearLayout>
-        </androidx.cardview.widget.CardView>
+        </com.google.android.material.card.MaterialCardView>
 
         <!-- Settings Card -->
-        <androidx.cardview.widget.CardView
+        <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             app:cardCornerRadius="12dp"
@@ -259,7 +259,6 @@
                         android:text="1"
                         android:inputType="number"
                         android:textAlignment="center"
-                        android:background="@android:drawable/editbox_background"
                         android:padding="8dp" />
                 </LinearLayout>
 
@@ -283,12 +282,11 @@
                         android:text="5"
                         android:inputType="number"
                         android:textAlignment="center"
-                        android:background="@android:drawable/editbox_background"
                         android:padding="8dp" />
                 </LinearLayout>
 
             </LinearLayout>
-        </androidx.cardview.widget.CardView>
+        </com.google.android.material.card.MaterialCardView>
 
         <!-- Actions -->
         <LinearLayout

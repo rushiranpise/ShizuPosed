@@ -14,7 +14,6 @@
         android:hint="Search logs..."
         android:inputType="text"
         android:padding="12dp"
-        android:background="@android:drawable/editbox_background"
         android:importantForAutofill="no"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -74,8 +73,8 @@
         android:layout_height="wrap_content"
         android:layout_margin="8dp"
         android:src="@android:drawable/ic_menu_delete"
-        app:backgroundTint="@android:color/holo_red_light"
-        app:tint="@android:color/white"
+        app:backgroundTint="?attr/colorError"
+        app:tint="?attr/colorOnPrimary"
         app:fabSize="mini"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
@@ -88,7 +87,7 @@
         android:layout_marginEnd="64dp"
         android:src="@android:drawable/ic_menu_share"
         app:backgroundTint="?attr/colorPrimary"
-        app:tint="@android:color/white"
+        app:tint="?attr/colorOnPrimary"
         app:fabSize="mini"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />

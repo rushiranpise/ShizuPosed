@@ -15,7 +15,6 @@
         android:hint="Search modules..."
         android:inputType="text"
         android:padding="12dp"
-        android:background="@android:drawable/editbox_background"
         android:importantForAutofill="no"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -66,7 +65,7 @@
         android:layout_margin="16dp"
         android:src="@android:drawable/ic_input_add"
         app:backgroundTint="?attr/colorPrimary"
-        app:tint="@android:color/white"
+        app:tint="?attr/colorOnPrimary"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 

@@ -28,7 +28,7 @@
             android:text="INFO"
             android:textSize="11sp"
             android:textStyle="bold"
-            android:textColor="@android:color/holo_green_light"
+            android:textColor="?attr/colorPrimary"
             android:layout_marginStart="8dp" />
 
         <TextView

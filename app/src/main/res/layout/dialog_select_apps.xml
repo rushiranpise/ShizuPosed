@@ -61,7 +61,6 @@
         android:hint="Search apps..."
         android:inputType="text"
         android:padding="12dp"
-        android:background="@android:drawable/editbox_background"
         android:layout_marginBottom="12dp" />
 
     <TextView

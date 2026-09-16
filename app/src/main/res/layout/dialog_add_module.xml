@@ -26,7 +26,6 @@
             android:hint="com.example.module"
             android:inputType="text"
             android:padding="12dp"
-            android:background="@android:drawable/editbox_background"
             android:layout_marginBottom="16dp" />
 
         <!-- Module Name -->
@@ -44,7 +43,6 @@
             android:hint="My Xposed Module"
             android:inputType="text"
             android:padding="12dp"
-            android:background="@android:drawable/editbox_background"
             android:layout_marginBottom="16dp" />
 
         <!-- Entry Point -->
@@ -62,7 +60,6 @@
             android:hint="com.example.MainHook"
             android:inputType="text"
             android:padding="12dp"
-            android:background="@android:drawable/editbox_background"
             android:layout_marginBottom="16dp" />
 
         <!-- Auto-detect -->
