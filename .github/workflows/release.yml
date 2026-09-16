@@ -46,8 +46,17 @@ jobs:
       - name: Stage release assets
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/ShizuPosed-${RELEASE_TAG}-debug.apk"
-          cp app/build/outputs/apk/release/app-release.apk "dist/ShizuPosed-${RELEASE_TAG}-release.apk"
+          debug_apk=$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)
+          release_apk=$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)
+
+          if [[ -z "$debug_apk" || -z "$release_apk" ]]; then
+            echo 'Expected debug and release APKs were not found:'
+            find app/build/outputs/apk -type f -print || true
+            exit 1
+          fi
+
+          cp "$debug_apk" "dist/ShizuPosed-${RELEASE_TAG}-debug.apk"
+          cp "$release_apk" "dist/ShizuPosed-${RELEASE_TAG}-release.apk"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
