@@ -149,8 +149,8 @@ gradle -Pandroid.aapt2FromMavenOverride="$PREFIX/bin/aapt2" :app:assembleDebug
 
 ### Signing a local release build
 
-The release build is unsigned unless `keystore.properties` exists at the
-repository root. The file is ignored by Git and must contain:
+The release build is signed when `keystore.properties` exists at the repository
+root. The file is ignored by Git and must contain:
 
 ```properties
 storeFile=/absolute/path/to/release.jks
@@ -172,9 +172,31 @@ It installs Java 21, Android platform `android-37.0`, build tools 35.0.0, and
 Gradle 9.7. It then builds both APK variants and creates a GitHub Release with
 the two APKs attached.
 
-The workflow currently has no signing secret configuration, so the published
-release APK is unsigned. Add a protected keystore setup before distributing a
-signed production APK.
+The release APK is signed from four repository or environment secrets:
+
+| Secret | Value |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | Base64 contents of the `.jks` file |
+| `ANDROID_KEYSTORE_PASSWORD` | Keystore password |
+| `ANDROID_KEY_ALIAS` | Key alias |
+| `ANDROID_KEY_PASSWORD` | Key password |
+
+The workflow decodes the keystore into the runner's temporary directory and
+creates `keystore.properties` for Gradle. Debug builds remain debuggable and
+are not used as the production artifact.
+
+To create the GitHub secrets from a local keystore:
+
+```bash
+base64 -w 0 shizuposed-release.jks > shizuposed-release.jks.b64
+gh secret set ANDROID_KEYSTORE_BASE64 < shizuposed-release.jks.b64
+gh secret set ANDROID_KEYSTORE_PASSWORD
+gh secret set ANDROID_KEY_ALIAS
+gh secret set ANDROID_KEY_PASSWORD
+```
+
+The last three commands prompt for values. Never commit the keystore, the
+`.b64` file, or `keystore.properties`.
 
 ## Compatibility and limitations
 
