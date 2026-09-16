@@ -140,6 +140,13 @@ packages the committed native libraries. The custom `makeDex` task requires the
 Android SDK path to be available through `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or
 `android.sdk.dir`.
 
+On Termux, if AGP cannot start its Maven-provided AAPT2 binary, pass the local
+override on the command line instead of committing a device-specific path:
+
+```bash
+gradle -Pandroid.aapt2FromMavenOverride="$PREFIX/bin/aapt2" :app:assembleDebug
+```
+
 ### Signing a local release build
 
 The release build is unsigned unless `keystore.properties` exists at the
