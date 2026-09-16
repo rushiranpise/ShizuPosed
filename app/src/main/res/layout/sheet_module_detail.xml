@@ -102,6 +102,15 @@
             android:fontFamily="monospace" />
 
         <Button
+            android:id="@+id/btnLaunchScopedApp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Launch scoped app under ShizuPosed"
+            android:textAllCaps="false"
+            android:enabled="false" />
+
+        <Button
             android:id="@+id/btnEditScope"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

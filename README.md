@@ -66,7 +66,8 @@ build.
 4. Open ShizuPosed and grant it Shizuku permission.
 5. Open **Modules**, add a module APK, and save it.
 6. Open the module details, choose **Edit scope**, and select the target apps.
-7. Use **Launch App under ShizuPosed** to start a scoped target app.
+7. Open the module details again and tap **Launch scoped app under ShizuPosed**.
+  Choose a target if more than one scoped app is available.
 
 A module is not considered active until a scoped app has been launched through
 ShizuPosed at least once. Enabling a module does not retroactively affect apps

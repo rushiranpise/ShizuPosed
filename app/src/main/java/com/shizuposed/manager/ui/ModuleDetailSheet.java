@@ -139,6 +139,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
         Button openApp = v.findViewById(R.id.btnOpenModuleApp);
         Button forceStop = v.findViewById(R.id.btnForceStopScoped);
+        Button launchScopedApp = v.findViewById(R.id.btnLaunchScopedApp);
         Button uninstall = v.findViewById(R.id.btnUninstallModule);
 
         if (openApp != null) {
@@ -164,6 +165,12 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
         if (forceStop != null) {
             forceStop.setOnClickListener(x -> forceStopScopedApps());
+        }
+
+        if (launchScopedApp != null) {
+            boolean hasScopedApps = module.hookedApps != null && !module.hookedApps.isEmpty();
+            launchScopedApp.setEnabled(hasScopedApps);
+            launchScopedApp.setOnClickListener(x -> chooseScopedAppAndLaunch());
         }
 
         if (uninstall != null) {
@@ -192,6 +199,52 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                     dismissAllowingStateLoss();
                 }
             });
+        }
+    }
+
+    private void chooseScopedAppAndLaunch() {
+        if (!isAdded() || module == null || module.hookedApps == null
+                || module.hookedApps.isEmpty()) {
+            Toast.makeText(requireContext(), "No apps are in this module's scope",
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        List<String> apps = new ArrayList<>(module.hookedApps);
+        if (apps.size() == 1) {
+            launchScopedApp(apps.get(0));
+            return;
+        }
+
+        String[] choices = apps.toArray(new String[0]);
+        new androidx.appcompat.app.AlertDialog.Builder(requireContext())
+                .setTitle("Choose an app to launch")
+                .setItems(choices, (dialog, which) -> launchScopedApp(choices[which]))
+                .show();
+    }
+
+    private void launchScopedApp(String packageName) {
+        if (!isAdded() || packageName == null) return;
+        try {
+            ShizukuHelper helper = ShizukuHelper.getInstance(requireContext());
+            if (!helper.isAvailable() || !helper.isAuthorized()) {
+                Toast.makeText(requireContext(), "Shizuku is not authorized",
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
+
+            Intent service = new Intent(requireContext(), ShizuPosedService.class);
+            service.setAction(ShizuPosedService.ACTION_LAUNCH_APP);
+            service.putExtra(ShizuPosedService.EXTRA_LAUNCH_PACKAGE, packageName);
+            requireContext().startForegroundService(service);
+            Toast.makeText(requireContext(),
+                    "Launching " + packageName + " under ShizuPosed",
+                    Toast.LENGTH_SHORT).show();
+            if (logger != null) logger.i("Requested scoped launch: " + packageName);
+        } catch (Throwable t) {
+            Toast.makeText(requireContext(), "Launch failed: " + t.getMessage(),
+                    Toast.LENGTH_LONG).show();
+            if (logger != null) logger.e("Scoped launch failed: " + t.getMessage());
         }
     }
 
