@@ -1,30 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:aapt="http://schemas.android.com/aapt"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:pathData="M31,63.928c0,0 6.4,-11 12.1,-13.1c7.2,-2.6 26,-1.4 26,-1.4l38.1,38.1L107,108.928l-32,-1L31,63.928z">
-        <aapt:attr name="android:fillColor">
-            <gradient 
-                android:startColor="#4CAF50"
-                android:endColor="#2E7D32"
-                android:startX="0"
-                android:startY="0"
-                android:endX="108"
-                android:endY="108"
-                android:type="linear" />
-        </aapt:attr>
-    </path>
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M65.3,45.828l3.8,-6.6c0.2,-0.4 0.1,-0.9 -0.3,-1.1c-0.4,-0.2 -0.9,-0.1 -1.1,0.3l-3.9,6.7c-6.3,-2.8 -13.4,-2.8 -19.7,0l-3.9,-6.7c-0.2,-0.4 -0.7,-0.5 -1.1,-0.3C38.8,38.328 38.7,38.828 38.9,39.228l3.8,6.6C36.2,49.428 31.7,56.028 31,63.928h46C76.3,56.028 71.8,49.428 65.3,45.828z"/>
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M43.2,50.528c0.2,0 0.4,-0.1 0.5,-0.2c0.3,-0.3 0.3,-0.7 0,-1c-0.3,-0.3 -0.7,-0.3 -1,0c-0.3,0.3 -0.3,0.7 0,1C42.8,50.428 43,50.528 43.2,50.528z"/>
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M64.8,50.528c0.2,0 0.4,-0.1 0.5,-0.2c0.3,-0.3 0.3,-0.7 0,-1c-0.3,-0.3 -0.7,-0.3 -1,0c-0.3,0.3 -0.3,0.7 0,1C64.4,50.428 64.6,50.528 64.8,50.528z"/>
-</vector>
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/shizuposed_logo"
+    android:gravity="fill" />

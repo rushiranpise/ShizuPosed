@@ -1,13 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:fillColor="#4CAF50"
-        android:pathData="M54,0 C24.2,0 0,24.2 0,54 C0,83.8 24.2,108 54,108 C83.8,108 108,83.8 108,54 C108,24.2 83.8,0 54,0 Z"/>
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M54,25 C40.2,25 29,36.2 29,50 C29,58.2 33,65.6 39.2,70.4 L36,78 L44.6,73.4 C47.6,74.8 50.8,75.6 54,75.6 C67.8,75.6 79,64.4 79,50.6 C79,36.8 67.8,25 54,25 Z M62,52.6 L46,52.6 L46,48.6 L62,48.6 L62,52.6 Z"/>
-</vector>
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/shizuposed_logo"
+    android:gravity="fill" />
