@@ -19,6 +19,9 @@ import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
 import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 import androidx.fragment.app.Fragment;
 import androidx.viewpager2.widget.ViewPager2;
 
@@ -78,6 +81,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        applySystemBarInsets();
 
         app = ShizuPosedManagerApp.getInstance();
         app.setMainActivity(this);
@@ -90,6 +94,20 @@ public class MainActivity extends AppCompatActivity {
 
         startServices();
         checkAndRequestPermissions();
+    }
+
+    private void applySystemBarInsets() {
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.activityRoot),
+                (view, insets) -> {
+                    Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+                    view.setPadding(
+                            systemBars.left,
+                            systemBars.top,
+                            systemBars.right,
+                            systemBars.bottom);
+                    return insets;
+                });
+        ViewCompat.requestApplyInsets(findViewById(R.id.activityRoot));
     }
 
     // ═════════════════════════════════════════════════════════════
