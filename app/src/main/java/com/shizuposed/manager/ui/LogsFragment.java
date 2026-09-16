@@ -1,5 +1,6 @@
 package com.shizuposed.manager.ui;
 
+import android.content.Context;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -38,18 +39,44 @@ public class LogsFragment extends Fragment {
     private List<LogEntry> logs = new ArrayList<>();
     private LogAdapter logAdapter;
 
+    private volatile boolean viewReady = false;
+
+    @Override
+    public void onAttach(@NonNull Context context) {
+        super.onAttach(context);
+        logger = Logger.getInstance(context);
+    }
+
     @Nullable
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
                              @Nullable Bundle savedInstanceState) {
         View view = inflater.inflate(R.layout.fragment_logs, container, false);
-
         initViews(view);
+        return view;
+    }
+
+    @Override
+    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+        super.onViewCreated(view, savedInstanceState);
+        viewReady = true;
         setupRecyclerView();
         setupListeners();
         loadLogs();
+    }
 
-        return view;
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        viewReady = false;
+        logRecyclerView = null;
+        logAdapter = null;
+        progressIndicator = null;
+        etSearchLogs = null;
+        btnRefresh = null;
+        fabClearLogs = null;
+        fabExportLogs = null;
+        tvEmptyState = null;
     }
 
     private void initViews(View view) {
@@ -60,59 +87,59 @@ public class LogsFragment extends Fragment {
         fabClearLogs = view.findViewById(R.id.fabClearLogs);
         fabExportLogs = view.findViewById(R.id.fabExportLogs);
         tvEmptyState = view.findViewById(R.id.tvEmptyState);
-
-        logger = Logger.getInstance(requireContext());
     }
 
     private void setupRecyclerView() {
+        if (logRecyclerView == null) return;
         logAdapter = new LogAdapter(logs);
         logRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
         logRecyclerView.setAdapter(logAdapter);
     }
 
     private void setupListeners() {
-        btnRefresh.setOnClickListener(v -> loadLogs());
-        fabClearLogs.setOnClickListener(v -> clearLogs());
-        fabExportLogs.setOnClickListener(v -> exportLogs());
-
-        etSearchLogs.setOnEditorActionListener((v, actionId, event) -> {
-            filterLogs(etSearchLogs.getText().toString());
-            return true;
-        });
+        if (btnRefresh != null) btnRefresh.setOnClickListener(v -> loadLogs());
+        if (fabClearLogs != null) fabClearLogs.setOnClickListener(v -> clearLogs());
+        if (fabExportLogs != null) fabExportLogs.setOnClickListener(v -> exportLogs());
+        if (etSearchLogs != null) {
+            etSearchLogs.setOnEditorActionListener((v, actionId, event) -> {
+                filterLogs(etSearchLogs.getText().toString());
+                return true;
+            });
+        }
     }
 
     private void loadLogs() {
+        if (!viewReady || logger == null || logAdapter == null) return;
         showLoading(true);
         try {
             logs = logger.getLogEntries();
             logAdapter.updateData(logs);
 
-            if (logs.isEmpty()) {
-                tvEmptyState.setVisibility(View.VISIBLE);
-                logRecyclerView.setVisibility(View.GONE);
-            } else {
-                tvEmptyState.setVisibility(View.GONE);
-                logRecyclerView.setVisibility(View.VISIBLE);
-                logRecyclerView.scrollToPosition(logs.size() - 1);
+            if (tvEmptyState != null) {
+                tvEmptyState.setVisibility(logs.isEmpty() ? View.VISIBLE : View.GONE);
             }
-
+            if (logRecyclerView != null) {
+                logRecyclerView.setVisibility(logs.isEmpty() ? View.GONE : View.VISIBLE);
+                if (!logs.isEmpty()) logRecyclerView.scrollToPosition(logs.size() - 1);
+            }
             logger.i("Loaded " + logs.size() + " log entries");
         } catch (Exception e) {
             logger.e("Error loading logs: " + e.getMessage());
-            Toast.makeText(requireContext(), "Failed to load logs", Toast.LENGTH_SHORT).show();
+            if (isAdded()) {
+                Toast.makeText(requireContext(), "Failed to load logs", Toast.LENGTH_SHORT).show();
+            }
         }
         showLoading(false);
     }
 
     private void filterLogs(String query) {
+        if (logAdapter == null) return;
         if (query.isEmpty()) {
             logAdapter.updateData(logs);
             return;
         }
-
         List<LogEntry> filtered = new ArrayList<>();
         String lowerQuery = query.toLowerCase();
-
         for (LogEntry entry : logs) {
             if (entry.message.toLowerCase().contains(lowerQuery)
                 || entry.tag.toLowerCase().contains(lowerQuery)
@@ -121,24 +148,27 @@ public class LogsFragment extends Fragment {
                 filtered.add(entry);
             }
         }
-
         logAdapter.updateData(filtered);
-        if (filtered.isEmpty()) {
+        if (filtered.isEmpty() && isAdded()) {
             Toast.makeText(requireContext(), "No matching logs", Toast.LENGTH_SHORT).show();
         }
     }
 
     private void clearLogs() {
+        if (!isAdded()) return;
         new AlertDialog.Builder(requireContext())
             .setTitle("Clear Logs")
             .setMessage("Are you sure you want to clear all logs?")
             .setPositiveButton("Clear", (dialog, which) -> {
+                if (logger == null || logAdapter == null) return;
                 logger.clearLogs();
                 logs.clear();
                 logAdapter.updateData(logs);
-                tvEmptyState.setVisibility(View.VISIBLE);
-                logRecyclerView.setVisibility(View.GONE);
-                Toast.makeText(requireContext(), "Logs cleared", Toast.LENGTH_SHORT).show();
+                if (tvEmptyState != null) tvEmptyState.setVisibility(View.VISIBLE);
+                if (logRecyclerView != null) logRecyclerView.setVisibility(View.GONE);
+                if (isAdded()) {
+                    Toast.makeText(requireContext(), "Logs cleared", Toast.LENGTH_SHORT).show();
+                }
                 logger.i("Logs cleared");
             })
             .setNegativeButton("Cancel", null)
@@ -146,19 +176,17 @@ public class LogsFragment extends Fragment {
     }
 
     private void exportLogs() {
+        if (logger == null || !isAdded() || getContext() == null) return;
         try {
             String logContent = logger.exportLogs();
             String fileName = "shizuposed_logs_"
                 + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault())
                 .format(new java.util.Date()) + ".txt";
-
             File logFile = new File(requireContext().getExternalFilesDir(null), fileName);
             com.shizuposed.manager.utils.FileUtils.writeFile(logFile, logContent);
-
             Toast.makeText(requireContext(),
                 "Logs exported to " + logFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
             logger.i("Logs exported to: " + logFile.getAbsolutePath());
-
         } catch (Exception e) {
             Toast.makeText(requireContext(), "Failed to export logs", Toast.LENGTH_SHORT).show();
             logger.e("Export error: " + e.getMessage());
@@ -166,11 +194,17 @@ public class LogsFragment extends Fragment {
     }
 
     public void refresh() {
+        if (!viewReady) {
+            if (logger != null) logger.d("refresh() skipped: view not ready");
+            return;
+        }
         loadLogs();
     }
 
     private void showLoading(boolean show) {
-        progressIndicator.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (progressIndicator != null) {
+            progressIndicator.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
     }
 
     private static class LogAdapter extends RecyclerView.Adapter<LogAdapter.LogViewHolder> {
@@ -193,7 +227,6 @@ public class LogsFragment extends Fragment {
         @Override
         public void onBindViewHolder(@NonNull LogViewHolder holder, int position) {
             LogEntry entry = logs.get(position);
-
             holder.tvTime.setText(timeFormat.format(new java.util.Date(entry.timestamp)));
             holder.tvLevel.setText(entry.level);
             holder.tvTag.setText(entry.tag);
@@ -215,13 +248,12 @@ public class LogsFragment extends Fragment {
                 case "ERROR":   color = android.R.color.holo_red_light; break;
                 default:        color = android.R.color.white; break;
             }
-            holder.tvLevel.setTextColor(holder.itemView.getContext().getColor(color));
+            holder.tvLevel.setTextColor(
+                holder.itemView.getContext().getColor(color));
         }
 
         @Override
-        public int getItemCount() {
-            return logs.size();
-        }
+        public int getItemCount() { return logs.size(); }
 
         void updateData(List<LogEntry> newLogs) {
             this.logs = newLogs != null ? newLogs : new ArrayList<>();
@@ -230,7 +262,6 @@ public class LogsFragment extends Fragment {
 
         static class LogViewHolder extends RecyclerView.ViewHolder {
             TextView tvTime, tvLevel, tvTag, tvMessage, tvPackage;
-
             LogViewHolder(@NonNull View itemView) {
                 super(itemView);
                 tvTime = itemView.findViewById(R.id.tvTime);

@@ -24,6 +24,7 @@ import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ShellUtils;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.util.List;
@@ -32,24 +33,34 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Foreground service that owns the ShizuPosed lifecycle.
  *
- * Responsibilities:
- *   - Stay foreground so Android doesn't kill us mid-hook.
- *   - Stage XposedHook.dex locally, then deploy it to the shell-writable
- *     directory via Shizuku.
- *   - Push module descriptors to the same directory.
- *   - Launch target apps under app_process so the hook framework runs
- *     in-process.
+ * FGS CONTRACT
+ * ------------
+ * Android requires that any service started via
+ * Context.startForegroundService() calls Service.startForeground()
+ * within 5 seconds, on the main thread, or the process is killed
+ * with ForegroundServiceDidNotStartInTimeException.
  *
- * Threading:
- *   All non-foreground work happens on a single background HandlerThread.
- *   The main thread only ever calls startForeground() and dispatches
- *   Intents to the worker. This is what keeps us under the 5-second
- *   foreground timer.
+ * This service therefore calls startForeground() as the very first
+ * statement in onCreate(), before any logging, authorization check,
+ * binder lookup, or file I/O.
  *
- * Shizuku state:
- *   ShizukuHelper owns the binder listeners. This service only reads
- *   isAvailable() / isAuthorized() and reacts to onShizukuAuthorized()
- *   calls from the Application.
+ * AUTHORIZATION CONTRACT
+ * ----------------------
+ * The service refuses to do work without an authorized
+ * Shizuku/Sui, but it does NOT refuse to be a foreground service.
+ *
+ * NATIVE PAYLOAD
+ * --------------
+ * Three files travel to the shell side:
+ *   • XposedHook.dex       — the hook payload
+ *   • libamiru.so          — Amiru native engine
+ *   • libshizuposed.so     — existing shared-dispatcher engine
+ *
+ * They are staged from APK-internal locations to external app
+ * storage (shell-readable) and then pushed to the shell's own
+ * files dir via Shizuku. XposedHook.dex comes from assets;
+ * the .so files come from the app's nativeLibraryDir where the
+ * platform placed them at install time.
  */
 public class ShizuPosedService extends Service {
     private static final String CHANNEL_ID = "shizuposed_service";
@@ -64,12 +75,22 @@ public class ShizuPosedService extends Service {
 
     private static final String SHELL_FILES_DIR   = "/data/user/0/com.android.shell/files";
     private static final String SHELL_DEX_PATH    = SHELL_FILES_DIR + "/XposedHook.dex";
+    private static final String SHELL_LIB_DIR     = SHELL_FILES_DIR + "/libs";
+    private static final String SHELL_AMIRU_PATH  = SHELL_LIB_DIR + "/libamiru.so";
+    private static final String SHELL_SZP_SO_PATH = SHELL_LIB_DIR + "/libshizuposed.so";
     private static final String SHELL_CACHE_DIR   = SHELL_FILES_DIR + "/.syscall_cache";
     private static final String SHELL_MODULES_DIR = SHELL_CACHE_DIR + "/modules";
     private static final String SHELL_HOOKED_DIR  = SHELL_CACHE_DIR + "/hooked";
 
+    /** Names of the native libraries that travel to the shell side. */
+    private static final String LIB_AMIRU       = "libamiru.so";
+    private static final String LIB_SHIZUPOSED  = "libshizuposed.so";
+
+    private static final boolean REQUIRE_AUTHORIZATION = true;
+
     private String localStagingDexPath;
     private String localStagingModulesDir;
+    private String localStagingLibDir;
     private String xposedHookDexPath;
 
     private static volatile boolean isServiceRunning = false;
@@ -85,6 +106,26 @@ public class ShizuPosedService extends Service {
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private final AtomicBoolean xposedHookStarted = new AtomicBoolean(false);
     private final AtomicBoolean dexDeployed = new AtomicBoolean(false);
+    private final AtomicBoolean libsDeployed = new AtomicBoolean(false);
+
+    private final AtomicBoolean onAuthorizedDispatched = new AtomicBoolean(false);
+    private final AtomicBoolean foregroundStarted = new AtomicBoolean(false);
+
+    // ═════════════════════════════════════════════════════════════
+    // AUTHORIZATION GATE
+    // ═════════════════════════════════════════════════════════════
+
+    private boolean isAuthorizedNow() {
+        try {
+            ShizukuHelper helper = ShizukuHelper.getInstance(this);
+            return helper.isAvailable() && helper.isAuthorized();
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.e("isAuthorizedNow failed: " + t.getMessage());
+            }
+            return false;
+        }
+    }
 
     // ═════════════════════════════════════════════════════════════
     // LIFECYCLE
@@ -95,14 +136,37 @@ public class ShizuPosedService extends Service {
         super.onCreate();
         isServiceRunning = true;
 
-        // 1. Notification channel before startForeground on O+.
+        // ═══════════════════════════════════════════════════════════
+        // STEP 1 — FGS CONTRACT (must be first)
+        // ═══════════════════════════════════════════════════════════
+
         createNotificationChannel();
 
-        // 2. Foreground IMMEDIATELY. Nothing slow before this.
-        startForeground(NOTIFICATION_ID, buildNotification("Service starting"));
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Service starting"));
+            foregroundStarted.set(true);
+        } catch (Throwable t) {
+            android.util.Log.e("ShizuPosedService",
+                "startForeground failed in onCreate", t);
+            isServiceRunning = false;
+            stopSelf();
+            return;
+        }
 
-        // 3. Slow init off the main thread.
+        // ═══════════════════════════════════════════════════════════
+        // STEP 2 — Everything else
+        // ═══════════════════════════════════════════════════════════
+
         logger = Logger.getInstance(this);
+
+        if (REQUIRE_AUTHORIZATION && !isAuthorizedNow()) {
+            logger.w("⛔ ShizuPosedService.onCreate: Shizuku not authorized — "
+                    + "stopping self (FGS contract already satisfied).");
+            isServiceRunning = false;
+            stopSelf();
+            return;
+        }
+
         logger.i("🚀 ShizuPosedService creating...");
 
         workerThread = new HandlerThread("ShizuPosedWorker",
@@ -125,11 +189,17 @@ public class ShizuPosedService extends Service {
                     new File(externalDir, "modules").getAbsolutePath();
                 new File(localStagingModulesDir).mkdirs();
 
+                localStagingLibDir =
+                    new File(externalDir, "libs").getAbsolutePath();
+                new File(localStagingLibDir).mkdirs();
+
                 xposedHookDexPath = SHELL_DEX_PATH;
 
                 logger.i("Local staging dex:  " + localStagingDexPath);
                 logger.i("Local staging mods: " + localStagingModulesDir);
+                logger.i("Local staging libs: " + localStagingLibDir);
                 logger.i("Target shell dex:   " + xposedHookDexPath);
+                logger.i("Target shell libs:  " + SHELL_LIB_DIR);
 
                 initComponents();
                 startServiceInternal();
@@ -143,15 +213,34 @@ public class ShizuPosedService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // ═══════════════════════════════════════════════════════════
+        // FGS CONTRACT — re-assert on every start
+        // ═══════════════════════════════════════════════════════════
+
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Service running"));
+            foregroundStarted.set(true);
+        } catch (Throwable t) {
+            android.util.Log.e("ShizuPosedService",
+                "startForeground failed in onStartCommand", t);
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // AUTHORIZATION GATE — after the FGS contract
+        // ═══════════════════════════════════════════════════════════
+
+        if (REQUIRE_AUTHORIZATION && !isAuthorizedNow()) {
+            if (logger != null) {
+                logger.w("⛔ onStartCommand: not authorized — stopping self");
+            }
+            isServiceRunning = false;
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
         isServiceRunning = true;
 
-        // Re-assert foreground on every entry. This is safe because
-        // we already called startForeground in onCreate — this is a
-        // cheap re-post, not a new 5-second timer.
-        startForeground(NOTIFICATION_ID, buildNotification("Service running"));
-
         if (workerHandler == null) {
-            // Very early re-entry; onCreate's worker will handle it.
             return START_STICKY;
         }
 
@@ -173,7 +262,7 @@ public class ShizuPosedService extends Service {
             } else if (ACTION_REPUSH_MODULES.equals(action)) {
                 logger.i("📨 ACTION_REPUSH_MODULES received");
                 workerHandler.post(() -> {
-                    if (ensureDexReady()) {
+                    if (ensurePayloadReady()) {
                         pushModulesToShellDir(moduleLoader.loadModules());
                     }
                 });
@@ -190,14 +279,25 @@ public class ShizuPosedService extends Service {
 
     @Override
     public void onDestroy() {
-        logger.i("ShizuPosedService destroying...");
+        if (logger != null) logger.i("ShizuPosedService destroying...");
         isRunning.set(false);
         isServiceRunning = false;
         if (processMonitor != null) processMonitor.stopMonitoring();
         if (workerThread != null) workerThread.quitSafely();
+
+        if (foregroundStarted.getAndSet(false)) {
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            } catch (Throwable ignored) {}
+        }
+
+        onAuthorizedDispatched.set(false);
+
         try {
-            stopForeground(STOP_FOREGROUND_REMOVE);
+            ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
+            if (app != null) app.onServiceDestroyed();
         } catch (Throwable ignored) {}
+
         super.onDestroy();
     }
 
@@ -231,6 +331,7 @@ public class ShizuPosedService extends Service {
     }
 
     private void updateNotification(String status) {
+        if (!foregroundStarted.get()) return;
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.notify(NOTIFICATION_ID, buildNotification(status));
     }
@@ -244,7 +345,7 @@ public class ShizuPosedService extends Service {
         moduleLoader = ModuleLoader.getInstance(this);
         processMonitor = ProcessMonitor.getInstance(this);
         processMonitor.setShizuPosedService(this);
-        logger.i("Components initialized (dex deployment deferred until Shizuku ready)");
+        logger.i("Components initialized (payload deployment deferred until Shizuku ready)");
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -255,7 +356,6 @@ public class ShizuPosedService extends Service {
         try {
             File staged = new File(localStagingDexPath);
             if (staged.exists() && staged.length() > 0) {
-                logger.i("✅ XposedHook.dex already staged locally");
                 staged.setReadable(true, false);
                 return true;
             }
@@ -282,6 +382,51 @@ public class ShizuPosedService extends Service {
         } catch (Exception e) {
             logger.e("❌ stageDexLocally error: " + e.getMessage());
             return false;
+        }
+    }
+
+    /**
+     * Copy a native library from the APK's nativeLibraryDir into
+     * external app storage, so the shell can read it later. Returns
+     * the staged file, or null on failure.
+     *
+     * The platform extracts jniLibs/<abi>/*.so into
+     * ApplicationInfo.nativeLibraryDir at install time. That path is
+     * under /data/app/.../lib/<abi>/, readable by the app but not by
+     * shell. Copying to getExternalFilesDir puts it somewhere shell
+     * can reach with a plain read.
+     */
+    private File stageNativeLib(String libName) {
+        try {
+            File src = new File(getApplicationInfo().nativeLibraryDir, libName);
+            if (!src.exists()) {
+                logger.w("stageNativeLib: source missing: " + src.getAbsolutePath());
+                return null;
+            }
+
+            File dst = new File(localStagingLibDir, libName);
+            if (dst.exists() && dst.length() == src.length()) {
+                dst.setReadable(true, false);
+                return dst;
+            }
+
+            try (InputStream in = new FileInputStream(src);
+                 FileOutputStream out = new FileOutputStream(dst)) {
+                byte[] buf = new byte[8192];
+                int n;
+                long total = 0;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                    total += n;
+                }
+                out.flush();
+                logger.i("✅ Staged " + libName + " (" + total + " bytes)");
+            }
+            dst.setReadable(true, false);
+            return dst;
+        } catch (Throwable t) {
+            logger.e("stageNativeLib(" + libName + ") failed: " + t.getMessage());
+            return null;
         }
     }
 
@@ -337,6 +482,97 @@ public class ShizuPosedService extends Service {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // NATIVE LIBRARY DEPLOYMENT
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Push libamiru.so and libshizuposed.so to the shell's own files
+     * directory. XposedHook loads them from there inside the target
+     * process via System.load().
+     *
+     * The manager process already has these libraries available via
+     * System.loadLibrary() (the platform resolved them from the APK),
+     * but the shell-side app_process is a different process with a
+     * different UID. It cannot read the APK's nativeLibraryDir, so
+     * the .so files must be copied to a shell-readable path first.
+     */
+    private boolean deployNativeLibsToShellDir() {
+        if (!shizukuHelper.isAuthorized()) {
+            logger.w("⚠️ Cannot deploy native libs: Shizuku not authorized");
+            return false;
+        }
+
+        try {
+            logger.i("📤 Deploying native libs to shell dir via Shizuku...");
+
+            ShellUtils.CommandResult mkdir =
+                shizukuHelper.executeCommand("mkdir -p " + SHELL_LIB_DIR);
+            if (!mkdir.isSuccess()) {
+                logger.e("❌ Failed to create shell lib dir: "
+                    + mkdir.getStderrString());
+                return false;
+            }
+
+            boolean amiruOk = pushOneLib(LIB_AMIRU, SHELL_AMIRU_PATH);
+            boolean szpOk = pushOneLib(LIB_SHIZUPOSED, SHELL_SZP_SO_PATH);
+
+            if (!amiruOk && !szpOk) {
+                logger.e("❌ No native libs deployed");
+                return false;
+            }
+            if (!amiruOk) {
+                logger.w("⚠️ libamiru.so not deployed — Amiru will be unavailable");
+            }
+            if (!szpOk) {
+                logger.w("⚠️ libshizuposed.so not deployed — NativeBackend will fall through");
+            }
+
+            logger.i("✅ Native libs deployed to: " + SHELL_LIB_DIR);
+            libsDeployed.set(true);
+            return true;
+
+        } catch (Exception e) {
+            logger.e("❌ deployNativeLibsToShellDir error: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Stage and push one native library. Returns true if the library
+     * is present and readable at the destination path.
+     */
+    private boolean pushOneLib(String libName, String dstPath) {
+        File staged = stageNativeLib(libName);
+        if (staged == null) return false;
+
+        String copy = "sh -c 'cat \"" + staged.getAbsolutePath()
+            + "\" > \"" + dstPath + "\"'";
+        ShellUtils.CommandResult r = shizukuHelper.executeCommand(copy);
+        if (!r.isSuccess()) {
+            logger.w("Failed to push " + libName + ": " + r.getStderrString());
+            return false;
+        }
+
+        shizukuHelper.executeCommand("chmod 755 " + dstPath);
+
+        ShellUtils.CommandResult verify =
+            shizukuHelper.executeCommand("test -s " + dstPath + " && echo OK");
+        if (!verify.isSuccess() || !verify.getStdoutString().contains("OK")) {
+            logger.w("Verification failed for " + libName + " at " + dstPath);
+            return false;
+        }
+        return true;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // PAYLOAD READINESS
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Legacy name, kept for callers. Ensures the dex is deployed.
+     * For full payload readiness (dex + libs) use ensurePayloadReady().
+     */
     public boolean ensureDexReady() {
         if (dexDeployed.get()) return true;
         if (!shizukuHelper.isAuthorized()) {
@@ -344,6 +580,17 @@ public class ShizuPosedService extends Service {
             return false;
         }
         return deployDexToShellDir();
+    }
+
+    /**
+     * Ensure both the dex and the native libraries are deployed to
+     * the shell side. Idempotent: the second call is a no-op if
+     * everything is already in place.
+     */
+    public boolean ensurePayloadReady() {
+        boolean dexOk = ensureDexReady();
+        boolean libsOk = libsDeployed.get() || deployNativeLibsToShellDir();
+        return dexOk && libsOk;
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -432,8 +679,8 @@ public class ShizuPosedService extends Service {
                 logger.i("Loaded " + modules.size() + " modules");
 
                 if (shizukuHelper.isAuthorized()) {
-                    logger.i("Shizuku authorized at startup — deploying dex...");
-                    if (ensureDexReady()) {
+                    logger.i("Shizuku authorized at startup — deploying payload...");
+                    if (ensurePayloadReady()) {
                         pushModulesToShellDir(modules);
                     }
                 } else {
@@ -460,14 +707,11 @@ public class ShizuPosedService extends Service {
             xposedHookStarted.set(false);
             return;
         }
-        if (!ensureDexReady()) {
-            logger.e("❌ Cannot prepare XposedHook without deployed dex");
+        if (!ensurePayloadReady()) {
+            logger.e("❌ Cannot prepare XposedHook without deployed payload");
             xposedHookStarted.set(false);
             return;
         }
-        // Push once. launchAppUnderShizuPosed will push again if the
-        // module set has changed since the last push, but it will not
-        // double-push on every launch.
         if (!pushModulesToShellDir(moduleLoader.loadModules())) {
             logger.w("⚠️ No modules pushed to shell dir (nothing will hook)");
         }
@@ -476,19 +720,30 @@ public class ShizuPosedService extends Service {
         updateNotification("Ready");
     }
 
-    /**
-     * Called by the Application when Shizuku authorization is granted.
-     * Safe to call multiple times; ensures dex + module push happen
-     * exactly once per authorization lifecycle.
-     */
     public void onShizukuAuthorized() {
+        if (!onAuthorizedDispatched.compareAndSet(false, true)) {
+            if (logger != null) logger.d("onShizukuAuthorized() already dispatched — skipping");
+            return;
+        }
         logger.i("📢 onShizukuAuthorized() — deploying now");
-        if (workerHandler == null) return;
+        if (workerHandler == null) {
+            onAuthorizedDispatched.set(false);
+            return;
+        }
         workerHandler.post(() -> {
-            if (ensureDexReady()) {
-                prepareXposedHook();
+            try {
+                if (ensurePayloadReady()) {
+                    prepareXposedHook();
+                }
+            } catch (Throwable t) {
+                logger.e("onShizukuAuthorized worker failed: " + t.getMessage());
+                onAuthorizedDispatched.set(false);
             }
         });
+    }
+
+    public void resetAuthorizedDispatch() {
+        onAuthorizedDispatched.set(false);
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -500,16 +755,11 @@ public class ShizuPosedService extends Service {
             logger.w("❌ Shizuku not authorized, cannot launch " + packageName);
             return false;
         }
-        if (!ensureDexReady()) {
-            logger.e("❌ Cannot launch " + packageName + ": dex not deployed");
+        if (!ensurePayloadReady()) {
+            logger.e("❌ Cannot launch " + packageName + ": payload not deployed");
             return false;
         }
 
-        // Push once per launch. If the module set is unchanged since the
-        // last push, pushModulesToShellDir will still copy files (cheap,
-        // a few hundred bytes each) and return true. That's simpler than
-        // tracking a "dirty" flag, and the copy is sub-millisecond per
-        // module.
         pushModulesToShellDir(moduleLoader.loadModules());
 
         String binary = shizukuHelper.getAppProcessBinary();
@@ -528,16 +778,20 @@ public class ShizuPosedService extends Service {
                 targetUid = ai.uid;
             } catch (Throwable ignored) {}
 
+            // Pass the shell lib dir as a property so XposedHook can
+            // find libamiru.so / libshizuposed.so without hardcoding.
             String cmd = String.format(
                 "CLASSPATH=%s %s " +
                 "-Xverify:none -Xallowinmemorycompilation " +
                 "-Xcompiler-option --target-api=%d " +
                 "-Djava.class.path=%s " +
+                "-Dshizuposed.shell.libs=%s " +
                 "/system/bin com.shizuposed.manager.core.XposedHook %s 0 %d &",
                 SHELL_DEX_PATH,
                 binary,
                 Build.VERSION.SDK_INT,
                 SHELL_DEX_PATH,
+                SHELL_LIB_DIR,
                 packageName,
                 targetUid
             );
@@ -562,16 +816,12 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * Not supported without root. Kept as a stub so callers get a clear
-     * "no" instead of a crash, and the log explains why.
-     */
     public boolean injectProcess(String packageName, int pid, int uid,
                                  List<ModuleInfo> modules) {
         logger.i("📥 injectProcess(" + packageName + ", pid=" + pid
                 + ", uid=" + uid + ")");
         if (!isRunning.get() || !shizukuHelper.isAuthorized()) return false;
-        if (!ensureDexReady()) return false;
+        if (!ensurePayloadReady()) return false;
         logger.w("Cannot hook externally-launched process " + packageName
             + " — use launchAppUnderShizuPosed() to launch it under ShizuPosed");
         return false;
@@ -584,5 +834,6 @@ public class ShizuPosedService extends Service {
     public boolean isRunning() { return isRunning.get(); }
     public boolean isXposedHookStarted() { return xposedHookStarted.get(); }
     public boolean isDexDeployed() { return dexDeployed.get(); }
+    public boolean isLibsDeployed() { return libsDeployed.get(); }
     public static boolean isServiceRunning() { return isServiceRunning; }
 }

@@ -74,6 +74,10 @@ public class HookEngine {
         // 2. Pine REPLACEMENT mode — catches methods Pine AUTO rejects
         d.register(new com.shizuposed.manager.core.backends.PineReplaceBackend());
 
+        d.register(new com.shizuposed.manager.core.backends.AmiruBackend());
+ 
+        d.register(new com.shizuposed.manager.core.backends.NativeBackend());
+
         // 3. Instrumentation — handles Application / Activity lifecycle
         //    hooks when Pine can't install them
         d.register(new com.shizuposed.manager.core.backends.InstrumentationBackend());

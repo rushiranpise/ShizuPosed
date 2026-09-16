@@ -58,7 +58,24 @@ public class ShizuPosedManagerApp extends Application {
             isShizukuAuthorized = false;
             serviceAutoStarted = false;
             notifiedAuthorized.set(false);
-            logger.w("Shizuku binder dead");
+            logger.w("Shizuku binder dead — stopping service");
+
+            // Tell the service to re-arm its onShizukuAuthorized() gate
+            // so the next grant re-triggers a full dex/module deploy.
+            try {
+                if (shizuPosedService != null) {
+                    shizuPosedService.resetAuthorizedDispatch();
+                }
+            } catch (Throwable ignored) {}
+
+            // Stop the service, since its authorization is gone.
+            try {
+                Intent stopIntent = new Intent(
+                    ShizuPosedManagerApp.this, ShizuPosedService.class);
+                stopService(stopIntent);
+            } catch (Throwable t) {
+                logger.e("Failed to stop service after binder death: " + t.getMessage());
+            }
         }
     };
 
@@ -81,7 +98,15 @@ public class ShizuPosedManagerApp extends Application {
             } else {
                 isShizukuAuthorized = false;
                 notifiedAuthorized.set(false);
-                logger.w("❌ Shizuku permission DENIED by user");
+                serviceAutoStarted = false;
+                logger.w("❌ Shizuku permission DENIED by user — ensuring service is stopped");
+
+                try {
+                    stopService(new Intent(
+                        ShizuPosedManagerApp.this, ShizuPosedService.class));
+                } catch (Throwable t) {
+                    logger.e("Failed to stop service after denial: " + t.getMessage());
+                }
             }
         }
     };
@@ -98,7 +123,6 @@ public class ShizuPosedManagerApp extends Application {
         createDirectories();
         setupNotificationChannel();
 
-        // Defer Shizuku setup so nothing binder-related runs on this stack.
         new Handler(Looper.getMainLooper()).post(this::deferredShizukuSetup);
 
         logger.i("ShizuPosed Manager initialized");
@@ -166,13 +190,6 @@ public class ShizuPosedManagerApp extends Application {
         return shizuPosedService;
     }
 
-    /**
-     * Tells the service that Shizuku is authorized, once per grant.
-     *
-     * Prefers a direct call so we do NOT need to fire startForegroundService()
-     * again (which would re-arm the 5-second foreground timer on an already
-     * running service and cause ForegroundServiceDidNotStartInTimeException).
-     */
     private void notifyServiceShizukuAuthorized() {
         if (!notifiedAuthorized.compareAndSet(false, true)) {
             logger.d("Already notified service about authorization — skipping");
@@ -197,7 +214,6 @@ public class ShizuPosedManagerApp extends Application {
             return;
         }
 
-        // Fallback: send the action intent.
         boolean alreadyRunning = false;
         try { alreadyRunning = ShizuPosedService.isServiceRunning(); } catch (Throwable ignored) {}
 
@@ -215,6 +231,12 @@ public class ShizuPosedManagerApp extends Application {
             logger.e("Failed to send ACTION_SHIZUKU_AUTHORIZED: " + e.getMessage());
             notifiedAuthorized.set(false);
         }
+    }
+
+    public void onServiceDestroyed() {
+        serviceAutoStarted = false;
+        notifiedAuthorized.set(false);
+        logger.d("Service destroyed — auto-start re-armed");
     }
 
     // ─── Shizuku state ─────────────────────────────────────────
@@ -259,6 +281,17 @@ public class ShizuPosedManagerApp extends Application {
             } else {
                 isShizukuAuthorized = false;
                 logger.w("⚠️ Shizuku permission NOT GRANTED");
+
+                if (serviceAutoStarted) {
+                    try {
+                        stopService(new Intent(
+                            ShizuPosedManagerApp.this, ShizuPosedService.class));
+                        serviceAutoStarted = false;
+                    } catch (Throwable t) {
+                        logger.e("Failed to stop unauthorized service: " + t.getMessage());
+                    }
+                }
+
                 if (!permissionRequested) {
                     permissionRequested = true;
                     new Handler(Looper.getMainLooper()).postDelayed(
@@ -294,28 +327,26 @@ public class ShizuPosedManagerApp extends Application {
             logger.d("Service already auto-started");
             return;
         }
+
+        // ── Authorization gate (BEFORE claiming the flag) ──────
+        if (!isShizukuAuthorized) {
+            logger.d("Cannot auto-start: not authorized yet");
+            return;
+        }
+
         if (!inAutoStart.compareAndSet(false, true)) return;
         try {
-            if (!isShizukuAuthorized) {
-                logger.d("Cannot auto-start: not authorized yet");
-                return;
-            }
-
             boolean alreadyRunning = false;
             try { alreadyRunning = ShizuPosedService.isServiceRunning(); } catch (Throwable ignored) {}
 
             Intent serviceIntent = new Intent(this, ShizuPosedService.class);
             if (alreadyRunning) {
-                // Do NOT fire a bare startForegroundService() on a running
-                // service — that re-arms the 5-second foreground timer.
                 logger.i("Service already running — sending ACTION_SHIZUKU_AUTHORIZED only");
                 serviceIntent.setAction(ACTION_SHIZUKU_AUTHORIZED);
             } else {
                 logger.i("🚀 Auto-starting ShizuPosedService...");
             }
 
-            // Set the flag BEFORE the call so a re-entrant call from another
-            // thread can't race us into a second startForegroundService().
             serviceAutoStarted = true;
 
             try {
@@ -335,7 +366,16 @@ public class ShizuPosedManagerApp extends Application {
         }
     }
 
+    /**
+     * Manual start path. Now gated by authorization, matching the
+     * automatic path. If Shizuku isn't authorized, this is a no-op
+     * with a log — the grant path will start it later.
+     */
     public void startServiceManually() {
+        if (!isShizukuAuthorized) {
+            logger.w("startServiceManually refused: not authorized yet");
+            return;
+        }
         try {
             Intent serviceIntent = new Intent(this, ShizuPosedService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

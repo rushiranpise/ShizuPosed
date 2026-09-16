@@ -3,11 +3,6 @@
     xmlns:app="http://schemas.android.com/apk/res-auto">
 
     <item
-        android:id="@+id/action_grant_shizuku"
-        android:title="Grant Shizuku Permission"
-        app:showAsAction="never" />
-
-    <item
         android:id="@+id/action_start_service"
         android:title="Start Service"
         app:showAsAction="never" />

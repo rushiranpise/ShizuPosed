@@ -4,16 +4,33 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 
-import com.shizuposed.manager.service.ShizuPosedService;
+import com.shizuposed.manager.ShizuPosedManagerApp;
 
+/**
+ * Boot receiver.
+ *
+ * What it does NOT do:
+ *   It does NOT start ShizuPosedService directly. The service refuses
+ *   to run without an authorized Shizuku, and at boot time Shizuku is
+ *   almost never ready yet — so trying to start it would just spin up
+ *   the service process, hit the authorization gate, and stopSelf().
+ *
+ * What it DOES do:
+ *   1. Reads the auto_start preference. If disabled, does nothing.
+ *   2. Touches ShizuPosedManagerApp to force the Application object to
+ *      be created. That registers the Shizuku binder listeners. From
+ *      that point on, the Application's own autoStartService() will
+ *      fire the service the moment the grant arrives — with no retry
+ *      loop, no fixed budget, and no wasted foreground-service calls.
+ *   3. As a fallback, if the Application is already alive AND Shizuku
+ *      is already authorized at boot (e.g. Sui or a rooted device
+ *      where Shizuku starts before us), it asks the Application to
+ *      auto-start now.
+ */
 public class BootReceiver extends BroadcastReceiver {
     private static final String TAG = "BootReceiver";
-    private static final long RETRY_DELAY_MS = 15_000L;
-    private static final int MAX_ATTEMPTS = 5;
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -31,41 +48,38 @@ public class BootReceiver extends BroadcastReceiver {
             return;
         }
 
-        Log.i(TAG, "BOOT_COMPLETED received, scheduling deferred service start");
+        Log.i(TAG, "BOOT_COMPLETED received — waking app so Shizuku listeners register");
+
         final Context appCtx = context.getApplicationContext();
-        scheduleDeferredStart(appCtx, 0);
-    }
 
-    private static void scheduleDeferredStart(final Context ctx, final int attempt) {
-        if (attempt >= MAX_ATTEMPTS) {
-            Log.w(TAG, "Giving up after " + attempt + " attempts");
-            return;
-        }
-
-        // Use a background Handler. The receiver returns immediately, so
-        // Android won't hold a wakelock, but the delay is short enough that
-        // the process will usually survive long enough to try.
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            SharedPreferences prefs = ctx.getSharedPreferences(
-                "shizuposed_settings", Context.MODE_PRIVATE);
-            if (!prefs.getBoolean("auto_start", false)) {
-                Log.i(TAG, "auto_start disabled at attempt " + attempt + " — aborting");
+        // Force the Application to be created. This registers the binder
+        // listeners inside ShizuPosedManagerApp, so from now on the
+        // auto-start will fire naturally when the Shizuku grant arrives.
+        try {
+            ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
+            if (app == null) {
+                // Application not created yet — touch it. This triggers
+                // Application.onCreate() on the next scheduler tick, which
+                // in turn calls deferredShizukuSetup() and registers the
+                // listeners.
+                appCtx.getApplicationContext();
+                Log.i(TAG, "App instance not yet created — will initialize on next tick");
                 return;
             }
 
-            try {
-                Intent svc = new Intent(ctx, ShizuPosedService.class);
-                ctx.startForegroundService(svc);
-                Log.i(TAG, "Deferred start attempt " + attempt + " succeeded");
-            } catch (Throwable t) {
-                Log.w(TAG, "Deferred start attempt " + attempt
-                    + " refused: " + t.getClass().getSimpleName()
-                    + ": " + t.getMessage());
-                // Try again after the delay. In practice, once the user
-                // opens the app the foreground start will succeed; this
-                // loop just gives the OS a few chances after boot.
-                scheduleDeferredStart(ctx, attempt + 1);
+            // The Application is already alive. If Shizuku happens to be
+            // authorized right now (rare at boot, but possible with Sui
+            // or a pre-started Shizuku), kick the auto-start.
+            if (app.isShizukuAuthorized()) {
+                Log.i(TAG, "Shizuku already authorized at boot — requesting auto-start");
+                app.autoStartService();
+            } else {
+                Log.i(TAG, "Shizuku not authorized yet — Application will "
+                        + "auto-start when the grant arrives");
             }
-        }, attempt == 0 ? RETRY_DELAY_MS : RETRY_DELAY_MS);
+        } catch (Throwable t) {
+            Log.w(TAG, "Boot wake failed: " + t.getClass().getSimpleName()
+                    + ": " + t.getMessage());
+        }
     }
 }

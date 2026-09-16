@@ -41,15 +41,22 @@
     </queries>
 
     <!--
-        Custom signature-level permission.
-        Gates access to ModuleStatusProvider so only apps signed with the
-        same key can query module status.
-    -->
-    <permission
-        android:name="com.shizuposed.manager.permission.READ_STATUS"
-        android:protectionLevel="signature" />
+        NOTE ON ModuleStatusProvider ACCESS
 
-    <uses-permission android:name="com.shizuposed.manager.permission.READ_STATUS" />
+        The provider is intentionally world-readable. It exposes only:
+          • whether a module is enabled (user preference)
+          • whether a module has loaded into at least one target process
+          • which target packages a module has loaded into
+          • framework name / version / enabled-module count
+
+        None of that is sensitive, and modules that display "Activated"
+        in their own UI must be able to query it from their own process
+        under their own signing key. A signature-level permission on the
+        provider blocks exactly that use case, because modules are never
+        signed with ShizuPosed's key.
+
+        LSPosed takes the same approach for its activation-query path.
+    -->
 
     <application
         android:name=".ShizuPosedManagerApp"
@@ -74,14 +81,23 @@
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
-        <!-- ModuleStatusProvider -->
+        <!--
+            ModuleStatusProvider
+
+            Exported and world-readable so module UIs in their own
+            processes can query their own activation state. Read-only:
+            insert/update/delete throw UnsupportedOperationException in
+            ModuleStatusProvider. grantUriPermissions is left enabled so
+            the manager can hand out read grants via Intent if it ever
+            needs to (it does not currently).
+        -->
         <provider
             android:name=".status.ModuleStatusProvider"
             android:authorities="com.shizuposed.manager.status"
             android:enabled="true"
             android:exported="true"
             android:multiprocess="false"
-            android:permission="com.shizuposed.manager.permission.READ_STATUS" />
+            android:grantUriPermissions="true" />
 
         <activity
             android:name=".MainActivity"

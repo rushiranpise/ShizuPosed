@@ -4,6 +4,7 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
+import android.util.Log;
 
 /**
  * LSPosed-compatible manager API shim.
@@ -26,6 +27,22 @@ import android.net.Uri;
  * derived from the shell-side hooked markers written by XposedHook,
  * not from the manager's module list, so it reflects what the
  * framework has actually done.
+ *
+ * CONTEXT RESOLUTION
+ * ------------------
+ * ActivityThread.currentApplication() reliably returns the
+ * Application only on the main thread. Module UIs frequently call
+ * isModuleActive() from background threads, WorkManager workers,
+ * ContentProvider.onCreate, etc., where it can return null.
+ *
+ * This class therefore tries three sources in order:
+ *   1. ActivityThread.currentApplication()
+ *   2. ActivityThread.currentActivityThread().getSystemContext()
+ *   3. A static fallback context registered via setFallbackContext()
+ *
+ * The static fallback is populated automatically by XposedBridge.log()
+ * on first use, since log() runs in a context where the caller usually
+ * has a valid Application.
  */
 public final class LSPosedManager {
 
@@ -38,7 +55,42 @@ public final class LSPosedManager {
     /** Authority of ShizuPosed's ModuleStatusProvider. */
     private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
 
+    private static final String LOG_TAG = "ShizuPosed";
+
+    /** Last-resort context, populated by setFallbackContext(). */
+    private static volatile Context sFallbackContext;
+
     private LSPosedManager() {}
+
+    // ═════════════════════════════════════════════════════════════
+    // FALLBACK CONTEXT
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Register a context to use when ActivityThread lookups fail.
+     * Called automatically by XposedBridge.log() so that later
+     * off-main-thread queries still have a usable Context.
+     */
+    public static void setFallbackContext(Context ctx) {
+        if (ctx != null) {
+            Context app = ctx.getApplicationContext();
+            sFallbackContext = app != null ? app : ctx;
+        }
+    }
+
+    /**
+     * Accessor for the shared fallback context.
+     *
+     * XposedBridge uses this as the last step in its own context
+     * resolution, so both shims agree on which Context is in play
+     * when ActivityThread lookups fail.
+     *
+     * @return the registered fallback Context, or null if none has
+     *         been set yet.
+     */
+    public static Context getFallbackContext() {
+        return sFallbackContext;
+    }
 
     // ═════════════════════════════════════════════════════════════
     // FRAMEWORK IDENTITY
@@ -65,7 +117,7 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "3.3";
+        return "3.9";
     }
 
     public static String getManagerPackageName() {
@@ -96,7 +148,9 @@ public final class LSPosedManager {
                     if (vIdx != -1) return "1".equals(c.getString(vIdx));
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "isModuleEnabled(" + packageName + ") failed", t);
+        }
         return false;
     }
 
@@ -108,15 +162,27 @@ public final class LSPosedManager {
             Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY + "/modules");
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
-                String[] out = new String[c.getCount()];
+                int idx = c.getColumnIndex("package");
+                if (idx == -1) return new String[0];
+
+                // Two passes: first count non-null rows, then fill.
+                // Avoids inserting nulls into the returned array.
+                int count = 0;
+                c.moveToPosition(-1);
+                while (c.moveToNext()) {
+                    if (c.getString(idx) != null) count++;
+                }
+                String[] out = new String[count];
+                c.moveToPosition(-1);
                 int i = 0;
                 while (c.moveToNext()) {
-                    int idx = c.getColumnIndex("package");
-                    out[i++] = idx != -1 ? c.getString(idx) : null;
+                    String pkg = c.getString(idx);
+                    if (pkg != null) out[i++] = pkg;
                 }
                 return out;
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "getEnabledModules failed", t);
             return new String[0];
         }
     }
@@ -140,7 +206,11 @@ public final class LSPosedManager {
      */
     public static boolean isModuleActive(String modulePackage) {
         Context ctx = currentApplication();
-        if (ctx == null) return false;
+        if (ctx == null) {
+            Log.w(LOG_TAG, "isModuleActive(" + modulePackage
+                + "): no Context available (off-main-thread?)");
+            return false;
+        }
         return isModuleActive(ctx, modulePackage);
     }
 
@@ -158,7 +228,9 @@ public final class LSPosedManager {
                     if (vIdx != -1) return "1".equals(c.getString(vIdx));
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "isModuleActive(" + modulePackage + ") failed", t);
+        }
         return false;
     }
 
@@ -182,27 +254,76 @@ public final class LSPosedManager {
                 + "/scope/" + modulePackage);
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
-                String[] out = new String[c.getCount()];
+                int idx = c.getColumnIndex("package");
+                if (idx == -1) return new String[0];
+
+                int count = 0;
+                c.moveToPosition(-1);
+                while (c.moveToNext()) {
+                    if (c.getString(idx) != null) count++;
+                }
+                String[] out = new String[count];
+                c.moveToPosition(-1);
                 int i = 0;
                 while (c.moveToNext()) {
-                    int idx = c.getColumnIndex("package");
-                    out[i++] = idx != -1 ? c.getString(idx) : null;
+                    String pkg = c.getString(idx);
+                    if (pkg != null) out[i++] = pkg;
                 }
                 return out;
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "getModuleScope(" + modulePackage + ") failed", t);
             return new String[0];
         }
     }
 
-    // ─── reflective Application lookup ───────────────────────────────
+    // ═════════════════════════════════════════════════════════════
+    // CONTEXT RESOLUTION
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Resolve a Context, working off the main thread.
+     *
+     * Order:
+     *   1. ActivityThread.currentApplication()
+     *   2. ActivityThread.currentActivityThread().getSystemContext()
+     *   3. sFallbackContext
+     */
     private static Context currentApplication() {
+        // Fast path: cached fallback
+        Context fb = sFallbackContext;
+
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
-            java.lang.reflect.Method m = at.getMethod("currentApplication");
-            Object o = m.invoke(null);
-            if (o instanceof Context) return (Context) o;
-        } catch (Throwable ignored) {}
-        return null;
+
+            // 1. currentApplication()
+            try {
+                java.lang.reflect.Method m = at.getMethod("currentApplication");
+                Object o = m.invoke(null);
+                if (o instanceof Context) {
+                    Context app = (Context) o;
+                    sFallbackContext = app;
+                    return app;
+                }
+            } catch (Throwable ignored) {}
+
+            // 2. currentActivityThread().getSystemContext()
+            try {
+                java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
+                Object thread = cur.invoke(null);
+                if (thread != null) {
+                    java.lang.reflect.Method getSys = at.getMethod("getSystemContext");
+                    Object sys = getSys.invoke(thread);
+                    if (sys instanceof Context) {
+                        return (Context) sys;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "currentApplication: reflective lookup failed", t);
+        }
+
+        return fb;
     }
 }

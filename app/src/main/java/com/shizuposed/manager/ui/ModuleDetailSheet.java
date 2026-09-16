@@ -1,5 +1,6 @@
 package com.shizuposed.manager.ui;
 
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.Drawable;
@@ -28,9 +29,6 @@ import com.shizuposed.manager.utils.Logger;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Module detail sheet — LSPosed-style.
- */
 public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
     private static final String ARG_PACKAGE = "packageName";
@@ -38,6 +36,10 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     private ModuleInfo module;
     private Logger logger;
     private PackageManager pm;
+    private ModuleLoader moduleLoader;
+
+    // Set in onViewCreated, cleared in onDestroyView.
+    private volatile boolean viewReady = false;
 
     public static ModuleDetailSheet newInstance(String packageName) {
         ModuleDetailSheet s = new ModuleDetailSheet();
@@ -45,6 +47,14 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         b.putString(ARG_PACKAGE, packageName);
         s.setArguments(b);
         return s;
+    }
+
+    @Override
+    public void onAttach(@NonNull Context context) {
+        super.onAttach(context);
+        logger = Logger.getInstance(context);
+        pm = context.getPackageManager();
+        moduleLoader = ModuleLoader.getInstance(context);
     }
 
     @Nullable
@@ -58,16 +68,21 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
-
-        logger = Logger.getInstance(requireContext());
-        pm = requireContext().getPackageManager();
+        viewReady = true;
 
         String pkg = getArguments() != null ? getArguments().getString(ARG_PACKAGE) : null;
-        module = pkg != null ? ModuleLoader.getInstance(requireContext()).getModule(pkg) : null;
+        if (pkg == null) {
+            if (logger != null) logger.w("ModuleDetailSheet: no package argument");
+            dismissAllowingStateLoss();
+            return;
+        }
+
+        module = moduleLoader != null ? moduleLoader.getModule(pkg) : null;
 
         if (module == null) {
-            Toast.makeText(requireContext(), "Module not found", Toast.LENGTH_SHORT).show();
-            dismiss();
+            if (isAdded()) Toast.makeText(requireContext(),
+                "Module not found", Toast.LENGTH_SHORT).show();
+            dismissAllowingStateLoss();
             return;
         }
 
@@ -76,17 +91,25 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         bindScope(view);
     }
 
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        viewReady = false;
+    }
+
     // ═════════════════════════════════════════════════════════════
     // HEADER
     // ═════════════════════════════════════════════════════════════
 
     private void bindHeader(View v) {
+        if (!viewReady || module == null) return;
+        if (!isAdded()) return;
+
         ImageView icon = v.findViewById(R.id.ivModuleIcon);
         TextView name = v.findViewById(R.id.tvModuleName);
         TextView pkgv = v.findViewById(R.id.tvModulePackage);
         TextView status = v.findViewById(R.id.tvModuleStatus);
 
-        // ✅ Same resolver the list uses — real launcher icon, or ic_module fallback
         if (icon != null) {
             Drawable d = IconResolver.resolve(requireContext(),
                 module.packageName, module.apkPath);
@@ -94,10 +117,16 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             else icon.setImageResource(R.drawable.ic_module);
         }
 
-        name.setText(module.name != null ? module.name : module.packageName);
-        pkgv.setText(module.packageName
-            + (module.version != null ? " • v" + module.version : ""));
-        status.setText(module.enabled ? "✅ Enabled" : "❌ Disabled");
+        if (name != null) {
+            name.setText(module.name != null ? module.name : module.packageName);
+        }
+        if (pkgv != null) {
+            pkgv.setText(module.packageName
+                + (module.version != null ? " • v" + module.version : ""));
+        }
+        if (status != null) {
+            status.setText(module.enabled ? "✅ Enabled" : "❌ Disabled");
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -105,52 +134,65 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     // ═════════════════════════════════════════════════════════════
 
     private void bindActions(View v) {
+        if (!viewReady || module == null || pm == null) return;
+        if (!isAdded()) return;
+
         Button openApp = v.findViewById(R.id.btnOpenModuleApp);
         Button forceStop = v.findViewById(R.id.btnForceStopScoped);
         Button uninstall = v.findViewById(R.id.btnUninstallModule);
 
-        Intent launch = pm.getLaunchIntentForPackage(module.packageName);
-        if (launch != null) {
-            openApp.setEnabled(true);
-            openApp.setOnClickListener(x -> {
-                try {
-                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    startActivity(launch);
-                } catch (Throwable t) {
-                    Toast.makeText(requireContext(),
-                        "Failed to open: " + t.getMessage(), Toast.LENGTH_SHORT).show();
-                }
-            });
-        } else {
-            openApp.setEnabled(false);
-            openApp.setText("Module has no UI");
+        if (openApp != null) {
+            Intent launch = pm.getLaunchIntentForPackage(module.packageName);
+            if (launch != null) {
+                openApp.setEnabled(true);
+                openApp.setOnClickListener(x -> {
+                    if (!isAdded()) return;
+                    try {
+                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(launch);
+                    } catch (Throwable t) {
+                        Toast.makeText(requireContext(),
+                            "Failed to open: " + t.getMessage(),
+                            Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } else {
+                openApp.setEnabled(false);
+                openApp.setText("Module has no UI");
+            }
         }
 
-        forceStop.setOnClickListener(x -> forceStopScopedApps());
+        if (forceStop != null) {
+            forceStop.setOnClickListener(x -> forceStopScopedApps());
+        }
 
-        uninstall.setOnClickListener(x -> {
-            Fragment parent = getParentFragment();
-            if (parent instanceof ModulesFragment) {
-                ((ModulesFragment) parent).uninstallModule(module);
-                dismiss();
-            } else {
-                boolean removed = ModuleLoader.getInstance(requireContext())
-                    .uninstallModule(module.packageName);
-                if (removed) {
-                    try {
-                        Intent i = new Intent(requireContext(), ShizuPosedService.class);
-                        i.setAction(ShizuPosedService.ACTION_REPUSH_MODULES);
-                        requireContext().startForegroundService(i);
-                    } catch (Throwable ignored) {}
-                    Toast.makeText(requireContext(),
-                        "Module uninstalled", Toast.LENGTH_SHORT).show();
+        if (uninstall != null) {
+            uninstall.setOnClickListener(x -> {
+                Fragment parent = getParentFragment();
+                if (parent instanceof ModulesFragment) {
+                    ((ModulesFragment) parent).uninstallModule(module);
+                    dismissAllowingStateLoss();
                 } else {
-                    Toast.makeText(requireContext(),
-                        "Uninstall failed", Toast.LENGTH_SHORT).show();
+                    if (moduleLoader == null) return;
+                    boolean removed = moduleLoader.uninstallModule(module.packageName);
+                    if (removed) {
+                        try {
+                            if (isAdded()) {
+                                Intent i = new Intent(requireContext(), ShizuPosedService.class);
+                                i.setAction(ShizuPosedService.ACTION_REPUSH_MODULES);
+                                requireContext().startForegroundService(i);
+                            }
+                        } catch (Throwable ignored) {}
+                        if (isAdded()) Toast.makeText(requireContext(),
+                            "Module uninstalled", Toast.LENGTH_SHORT).show();
+                    } else {
+                        if (isAdded()) Toast.makeText(requireContext(),
+                            "Uninstall failed", Toast.LENGTH_SHORT).show();
+                    }
+                    dismissAllowingStateLoss();
                 }
-                dismiss();
-            }
-        });
+            });
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -158,6 +200,8 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     // ═════════════════════════════════════════════════════════════
 
     private void bindScope(View v) {
+        if (!viewReady || module == null) return;
+
         TextView count = v.findViewById(R.id.tvScopeCount);
         TextView list = v.findViewById(R.id.tvScopeList);
         Button edit = v.findViewById(R.id.btnEditScope);
@@ -166,34 +210,41 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             ? new ArrayList<>(module.hookedApps)
             : new ArrayList<>();
 
-        count.setText("Scope (" + apps.size() + " app"
-            + (apps.size() != 1 ? "s" : "") + ")");
-
-        if (apps.isEmpty()) {
-            list.setText("No apps scoped");
-        } else {
-            StringBuilder sb = new StringBuilder();
-            int shown = Math.min(apps.size(), 6);
-            for (int i = 0; i < shown; i++) {
-                sb.append("• ").append(apps.get(i));
-                if (i < shown - 1) sb.append('\n');
-            }
-            if (apps.size() > shown) {
-                sb.append("\n• +").append(apps.size() - shown).append(" more");
-            }
-            list.setText(sb.toString());
+        if (count != null) {
+            count.setText("Scope (" + apps.size() + " app"
+                + (apps.size() != 1 ? "s" : "") + ")");
         }
 
-        edit.setOnClickListener(x -> {
-            Fragment parent = getParentFragment();
-            if (parent instanceof ModulesFragment) {
-                dismiss();
-                ((ModulesFragment) parent).openScopeEditor(module);
+        if (list != null) {
+            if (apps.isEmpty()) {
+                list.setText("No apps scoped");
             } else {
-                Toast.makeText(requireContext(),
-                    "Edit scope from the Modules tab", Toast.LENGTH_SHORT).show();
+                StringBuilder sb = new StringBuilder();
+                int shown = Math.min(apps.size(), 6);
+                for (int i = 0; i < shown; i++) {
+                    sb.append("• ").append(apps.get(i));
+                    if (i < shown - 1) sb.append('\n');
+                }
+                if (apps.size() > shown) {
+                    sb.append("\n• +").append(apps.size() - shown).append(" more");
+                }
+                list.setText(sb.toString());
             }
-        });
+        }
+
+        if (edit != null) {
+            edit.setOnClickListener(x -> {
+                Fragment parent = getParentFragment();
+                if (parent instanceof ModulesFragment) {
+                    dismissAllowingStateLoss();
+                    ((ModulesFragment) parent).openScopeEditor(module);
+                } else if (isAdded()) {
+                    Toast.makeText(requireContext(),
+                        "Edit scope from the Modules tab",
+                        Toast.LENGTH_SHORT).show();
+                }
+            });
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -201,12 +252,12 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     // ═════════════════════════════════════════════════════════════
 
     private void forceStopScopedApps() {
-        if (module.hookedApps == null || module.hookedApps.isEmpty()) {
+        if (!isAdded()) return;
+        if (module == null || module.hookedApps == null || module.hookedApps.isEmpty()) {
             Toast.makeText(requireContext(),
                 "No apps scoped — nothing to stop", Toast.LENGTH_SHORT).show();
             return;
         }
-
         try {
             ShizukuHelper h = ShizukuHelper.getInstance(requireContext());
             if (!h.isAvailable() || !h.isAuthorized()) {
@@ -214,10 +265,9 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                     "Shizuku not authorized", Toast.LENGTH_SHORT).show();
                 return;
             }
-
             StringBuilder sb = new StringBuilder("am force-stop");
             for (String p : module.hookedApps) {
-                sb.append(' ').append(p);
+                if (p != null) sb.append(' ').append(p);
             }
             h.executeCommand(sb.toString());
             Toast.makeText(requireContext(),
@@ -225,7 +275,8 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
             Toast.makeText(requireContext(),
-                "Force-stop failed: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+                "Force-stop failed: " + t.getMessage(),
+                Toast.LENGTH_SHORT).show();
         }
     }
 }

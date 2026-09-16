@@ -28,6 +28,9 @@ public final class XposedBridge {
     /** Logcat tag for XposedBridge.log output. */
     private static final String LOG_TAG = "Xposed";
 
+    /** Logcat tag for framework-level diagnostics. */
+    private static final String FRAMEWORK_TAG = "ShizuPosed";
+
     /** Authority of ShizuPosed's ModuleStatusProvider. */
     private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
 
@@ -59,6 +62,10 @@ public final class XposedBridge {
     // shell-side log at
     // /data/user/0/com.android.shell/files/.syscall_cache/xposed.log
     // already captures framework output separately.
+    //
+    // As a side effect, each log() call opportunistically refreshes
+    // LSPosedManager's fallback Context. This is what makes later
+    // off-main-thread isModuleActive() queries work.
     // ═════════════════════════════════════════════════════════════
 
     /** Log a plain string. */
@@ -66,6 +73,7 @@ public final class XposedBridge {
         try {
             Log.i(LOG_TAG, text == null ? "null" : text);
         } catch (Throwable ignored) {}
+        refreshFallbackContext();
     }
 
     /** Log an exception's stack trace. */
@@ -73,12 +81,27 @@ public final class XposedBridge {
         try {
             Log.e(LOG_TAG, Log.getStackTraceString(t));
         } catch (Throwable ignored) {}
+        refreshFallbackContext();
     }
 
     /** Log a message with an associated exception. */
     public static void log(String text, Throwable t) {
         try {
             Log.e(LOG_TAG, text == null ? "null" : text, t);
+        } catch (Throwable ignored) {}
+        refreshFallbackContext();
+    }
+
+    /**
+     * Opportunistically capture an Application context for later use.
+     * Called from log() so that a module's first log line — which
+     * almost always runs on the main thread — seeds the fallback.
+     */
+    private static void refreshFallbackContext() {
+        try {
+            if (LSPosedManager.getFallbackContext() != null) return;
+            Context ctx = currentApplication();
+            if (ctx != null) LSPosedManager.setFallbackContext(ctx);
         } catch (Throwable ignored) {}
     }
 
@@ -87,7 +110,16 @@ public final class XposedBridge {
     // ═════════════════════════════════════════════════════════════
 
     public static boolean isModuleEnabled() {
-        return true;
+        Context ctx = currentApplication();
+        if (ctx == null) return false;
+        try {
+            String pkg = ctx.getPackageName();
+            if (pkg == null || pkg.isEmpty()) return false;
+            return isModuleEnabled(ctx, pkg);
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "isModuleEnabled() failed", t);
+            return false;
+        }
     }
 
     public static boolean isModuleEnabled(String packageName) {
@@ -110,7 +142,9 @@ public final class XposedBridge {
                     if (vIdx != -1) return "1".equals(c.getString(vIdx));
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "isModuleEnabled(" + packageName + ") failed", t);
+        }
         return false;
     }
 
@@ -121,15 +155,25 @@ public final class XposedBridge {
             Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY + "/modules");
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
-                String[] out = new String[c.getCount()];
+                int idx = c.getColumnIndex("package");
+                if (idx == -1) return new String[0];
+
+                int count = 0;
+                c.moveToPosition(-1);
+                while (c.moveToNext()) {
+                    if (c.getString(idx) != null) count++;
+                }
+                String[] out = new String[count];
+                c.moveToPosition(-1);
                 int i = 0;
                 while (c.moveToNext()) {
-                    int idx = c.getColumnIndex("package");
-                    out[i++] = idx != -1 ? c.getString(idx) : null;
+                    String pkg = c.getString(idx);
+                    if (pkg != null) out[i++] = pkg;
                 }
                 return out;
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "getEnabledModules failed", t);
             return new String[0];
         }
     }
@@ -139,7 +183,13 @@ public final class XposedBridge {
     // ═════════════════════════════════════════════════════════════
 
     public static boolean isModuleActive(String modulePackage) {
-        return LSPosedManager.isModuleActive(modulePackage);
+        Context ctx = currentApplication();
+        if (ctx == null) {
+            Log.w(FRAMEWORK_TAG, "isModuleActive(" + modulePackage
+                + "): no Context available (off-main-thread?)");
+            return false;
+        }
+        return LSPosedManager.isModuleActive(ctx, modulePackage);
     }
 
     public static boolean isModuleActive(Context context, String modulePackage) {
@@ -147,21 +197,50 @@ public final class XposedBridge {
     }
 
     public static String[] getModuleScope(String modulePackage) {
-        return LSPosedManager.getModuleScope(modulePackage);
+        Context ctx = currentApplication();
+        if (ctx == null) return new String[0];
+        return LSPosedManager.getModuleScope(ctx, modulePackage);
     }
 
     public static String[] getModuleScope(Context context, String modulePackage) {
         return LSPosedManager.getModuleScope(context, modulePackage);
     }
 
-    // ─── minimal reflective Application lookup ───────────────────────
+    // ═════════════════════════════════════════════════════════════
+    // CONTEXT RESOLUTION
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Resolve a Context, working off the main thread.
+     *
+     * Order:
+     *   1. ActivityThread.currentApplication()
+     *   2. ActivityThread.currentActivityThread().getSystemContext()
+     *   3. LSPosedManager's static fallback (shared with this class)
+     */
     private static Context currentApplication() {
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
-            java.lang.reflect.Method m = at.getMethod("currentApplication");
-            Object o = m.invoke(null);
-            if (o instanceof Context) return (Context) o;
-        } catch (Throwable ignored) {}
-        return null;
+
+            try {
+                java.lang.reflect.Method m = at.getMethod("currentApplication");
+                Object o = m.invoke(null);
+                if (o instanceof Context) return (Context) o;
+            } catch (Throwable ignored) {}
+
+            try {
+                java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
+                Object thread = cur.invoke(null);
+                if (thread != null) {
+                    java.lang.reflect.Method getSys = at.getMethod("getSystemContext");
+                    Object sys = getSys.invoke(thread);
+                    if (sys instanceof Context) return (Context) sys;
+                }
+            } catch (Throwable ignored) {}
+
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "currentApplication: reflective lookup failed", t);
+        }
+        return LSPosedManager.getFallbackContext();
     }
 }

@@ -1,8 +1,10 @@
 package com.shizuposed.manager.core;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.utils.Logger;
@@ -37,6 +39,14 @@ import java.util.zip.ZipFile;
  *   • Our own package (hooking ShizuPosed from ShizuPosed is useless)
  *   • Packages already in the ModuleLoader cache with the same apkPath
  *     (avoids needless rescans)
+ *
+ * hasUi
+ * -----
+ * Each detected module is tagged with hasUi = true if its APK
+ * declares a launcher activity. The Modules tab does NOT filter on
+ * this flag — every module is shown. The flag is consumed only by
+ * the scope editor, which uses it to decide whether a module can
+ * select its own package as a hook target.
  */
 public final class ModuleScanner {
 
@@ -124,12 +134,15 @@ public final class ModuleScanner {
                 module.enabled = existingOrEnabled(loader, ai.packageName);
                 module.hookedApps = preserveScope(loader, ai.packageName);
 
+                // Tag with hasUi. Consumed by the scope editor only.
+                module.hasUi = hasLauncherActivity(context, ai.packageName);
+
                 boolean ok = loader.installModule(module);
                 if (ok) {
                     result.newlyRegistered++;
                     result.newlyRegisteredPackages.add(ai.packageName);
                     logger.i("[" + TAG + "] Auto-detected module: "
-                        + ai.packageName + " (" + entry + ")");
+                        + ai.packageName + " (" + entry + ", hasUi=" + module.hasUi + ")");
                 }
 
             } catch (Throwable t) {
@@ -147,28 +160,50 @@ public final class ModuleScanner {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // PURGE STALE MODULES
+    // UI DETECTION
     // ═════════════════════════════════════════════════════════════
 
     /**
-     * Remove registered modules whose backing APK no longer exists.
+     * Does the given package declare a launcher activity?
      *
-     * A module is kept if either:
-     *   • Its apkPath points at a file that still exists on disk, OR
-     *   • Its package is still installed (PackageManager can see it).
+     * Two-step check:
+     *   1. queryIntentActivities with MATCH_DEFAULT_ONLY — the
+     *      canonical launcher query. Catches normal launcher icons.
+     *   2. getLaunchIntentForPackage — catches activity aliases and
+     *      leanback-launcher entries the query above can miss.
      *
-     * A module is removed if neither is true — meaning the user
-     * uninstalled the module externally and the APK it referenced is
-     * also gone.
+     * Step 2 is what makes modules like Hide My Applist detectable:
+     * they sometimes declare their settings activity via an alias
+     * that the strict MATCH_DEFAULT_ONLY filter rejects.
      *
-     * Modules added manually via the FAB are kept as long as their
-     * APK is still on disk, even if the package was never installed
-     * system-wide.
-     *
-     * @param purgedOut if non-null, package names of removed modules
-     *                  are appended to this list.
-     * @return number of modules removed.
+     * Returns false on any error. Conservative default is "headless",
+     * which suppresses the self-scope entry in the scope editor.
      */
+    public static boolean hasLauncherActivity(Context context, String pkg) {
+        if (context == null || pkg == null) return false;
+        try {
+            PackageManager pm = context.getPackageManager();
+
+            // Step 1: explicit launcher intent query
+            Intent intent = new Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+                .setPackage(pkg);
+            List<ResolveInfo> activities = pm.queryIntentActivities(
+                intent, PackageManager.MATCH_DEFAULT_ONLY);
+            if (activities != null && !activities.isEmpty()) return true;
+
+            // Step 2: fallback for aliases / leanback
+            Intent launch = pm.getLaunchIntentForPackage(pkg);
+            return launch != null && launch.getComponent() != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // PURGE STALE MODULES
+    // ═════════════════════════════════════════════════════════════
+
     public static int purgeUninstalledModules(Context context,
                                               List<String> purgedOut) {
         Logger logger = Logger.getInstance(context);
@@ -176,14 +211,11 @@ public final class ModuleScanner {
         ModuleLoader loader = ModuleLoader.getInstance(context);
 
         int removed = 0;
-
-        // Snapshot — uninstallModule mutates the cache while we iterate
         List<ModuleInfo> snapshot = new ArrayList<>(loader.getCachedModules());
 
         for (ModuleInfo m : snapshot) {
             if (m == null || m.packageName == null) continue;
 
-            // 1. Does the module's APK still exist on disk?
             boolean apkExists = false;
             if (m.apkPath != null) {
                 try {
@@ -191,7 +223,6 @@ public final class ModuleScanner {
                 } catch (Throwable ignored) {}
             }
 
-            // 2. Is the package still installed on the device?
             boolean packageInstalled = false;
             try {
                 pm.getPackageInfo(m.packageName, 0);
@@ -199,7 +230,6 @@ public final class ModuleScanner {
             } catch (PackageManager.NameNotFoundException ignored) {
             } catch (Throwable ignored) {}
 
-            // Keep if either is true. Remove only if both are false.
             if (apkExists || packageInstalled) continue;
 
             try {
@@ -222,7 +252,6 @@ public final class ModuleScanner {
         return removed;
     }
 
-    /** Convenience overload for callers that don't need the list. */
     public static int purgeUninstalledModules(Context context) {
         return purgeUninstalledModules(context, null);
     }
@@ -231,7 +260,6 @@ public final class ModuleScanner {
     // HELPERS
     // ═════════════════════════════════════════════════════════════
 
-    /** Returns the first non-empty line of assets/xposed_init, or null. */
     private static String readXposedInit(String apkPath) {
         try (ZipFile zip = new ZipFile(apkPath)) {
             ZipEntry entry = zip.getEntry("assets/xposed_init");
@@ -260,14 +288,12 @@ public final class ModuleScanner {
         }
     }
 
-    /** Preserve the enable state across rescans; default new modules to enabled. */
     private static boolean existingOrEnabled(ModuleLoader loader, String pkg) {
         ModuleInfo existing = loader.getModule(pkg);
         if (existing != null) return existing.enabled;
         return true;
     }
 
-    /** Preserve the scope across rescans. */
     private static Set<String> preserveScope(ModuleLoader loader, String pkg) {
         ModuleInfo existing = loader.getModule(pkg);
         if (existing != null && existing.hookedApps != null) {

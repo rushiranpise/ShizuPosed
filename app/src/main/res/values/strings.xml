@@ -165,7 +165,6 @@
     <string name="shizuku_unavailable">Unavailable</string>
     <string name="shizuku_authorized">Authorized</string>
     <string name="shizuku_unauthorized">Not Authorized</string>
-    <string name="grant_shizuku">Grant Shizuku Permission</string>
     <string name="shizuku_permission_required">Shizuku permission required for privileged operations</string>
     <string name="shizuku_grant_toast">Please grant permission in Shizuku app</string>
 

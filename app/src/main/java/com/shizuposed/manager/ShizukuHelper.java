@@ -26,20 +26,19 @@ import rikka.sui.Sui;
  * Single source of truth for Shizuku / Shevery / Sui state.
  *
  * Design:
- *   - Listeners are registered synchronously in the constructor,
- *     before any state check. Nothing can be missed.
- *   - checkPermission() runs ONLY from onBinderReceived. Never
- *     eagerly. This eliminates the cold-start false "denied" that
- *     occurs when checkSelfPermission() is called before the binder
- *     is delivered by the provider.
- *   - requestPermission() is idempotent. forceRequestPermission()
- *     resets in-flight state so the menu action always works.
- *   - Shevery detection: Shevery ships a legacy stub under
- *     moe.shizuku.privileged.api so apps built against the original
- *     Shizuku API still bind. That stub does NOT always reflect
- *     grants made in Shevery's own UI, so when Shevery is the only
- *     provider present, we log a warning and prefer the "sticky
- *     listener + explicit recheck" path over the eager path.
+ *   - Listeners are registered synchronously in the constructor.
+ *   - checkPermission() runs ONLY from onBinderReceived,
+ *     refreshFromBinder(), and the request-result listener. Never
+ *     eagerly during construction.
+ *   - isAuthorized is monotonic during the settle window: a single
+ *     transient PERMISSION_DENIED from checkSelfPermission() does
+ *     not downgrade a known grant. This prevents the toolbar label
+ *     from flip-flopping when the grant is written by Shizuku but
+ *     the first re-read races it.
+ *   - Provider detection is stable: Shevery is prioritized when
+ *     installed, since Shevery ships a legacy stub under
+ *     moe.shizuku.privileged.api and impersonates Shizuku. Reporting
+ *     "Shizuku" while Shevery is active is misleading.
  *
  * Anything that needs Shizuku state should call into this class.
  * Do not call Shizuku.* directly from elsewhere in the app.
@@ -49,18 +48,23 @@ public class ShizukuHelper {
     private static final int SHIZUKU_CODE = 0xCA07A;
     private static ShizukuHelper instance;
 
+    /** Grace window after a successful grant during which a
+     *  transient DENIED from checkSelfPermission() will not
+     *  downgrade isAuthorized. */
+    private static final long GRANT_SETTLE_MS = 5000L;
+
     private final Context context;
     private final Logger logger;
 
-    // State updated only by Shizuku callbacks, read by everyone else.
     private volatile boolean isAvailable = false;
     private volatile boolean isAuthorized = false;
     private volatile int shizukuVersion = 0;
     private volatile boolean isSui = false;
     private volatile boolean binderStatus = false;
 
-    // Shevery / Shizuku identification. These are metadata reads and
-    // do not race the binder.
+    /** Timestamp of the last known grant, for the settle window. */
+    private volatile long lastGrantTimestamp = 0L;
+
     private volatile boolean realShizukuInstalled = false;
     private volatile boolean sheveryInstalled = false;
 
@@ -101,9 +105,7 @@ public class ShizukuHelper {
             } catch (Throwable ignored) {}
             logger.i("Shizuku binder received (v" + shizukuVersion
                     + ", provider=" + providerName() + ")");
-
-            // The ONLY place checkPermission() is allowed to run.
-            checkPermission();
+            checkPermission("binderReceived");
         }
     };
 
@@ -114,6 +116,7 @@ public class ShizukuHelper {
             binderStatus = false;
             isAvailable = false;
             isAuthorized = false;
+            lastGrantTimestamp = 0L;
             permissionRequestInFlight.set(false);
             grantToastShown.set(false);
             cachedAppProcessBinary = null;
@@ -126,17 +129,17 @@ public class ShizukuHelper {
         @Override
         public void onRequestPermissionResult(int requestCode, int grantResult) {
             if (requestCode != SHIZUKU_CODE) return;
-
             permissionRequestInFlight.set(false);
 
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                isAuthorized = true;
+                markAuthorized("onRequestPermissionResult");
                 grantToastShown.set(true);
                 logger.i("✅ Shizuku permission GRANTED via provider=" + providerName());
                 notifyPermissionGranted();
                 autoStartServiceIfPossible();
             } else {
                 isAuthorized = false;
+                lastGrantTimestamp = 0L;
                 logger.w("❌ Shizuku permission DENIED via provider=" + providerName());
                 notifyPermissionDenied();
             }
@@ -150,18 +153,12 @@ public class ShizukuHelper {
     private ShizukuHelper(Context context) {
         this.context = context.getApplicationContext();
         this.logger = Logger.getInstance(this.context);
-
-        // Register listeners FIRST, synchronously, before anything
-        // else. Nothing binder-related runs before this.
         registerListeners();
-
         initShizuku();
     }
 
     public static synchronized ShizukuHelper getInstance(Context context) {
-        if (instance == null) {
-            instance = new ShizukuHelper(context);
-        }
+        if (instance == null) instance = new ShizukuHelper(context);
         return instance;
     }
 
@@ -173,27 +170,21 @@ public class ShizukuHelper {
                 Shizuku.addBinderReceivedListenerSticky(binderListener);
                 Shizuku.addBinderDeadListener(binderDeadListener);
                 Shizuku.addRequestPermissionResultListener(permissionResultListener);
-                // Only after all adds succeed.
                 listenersRegistered.set(true);
                 logger.d("Shizuku listeners registered");
             } catch (Throwable t) {
                 logger.e("Failed to register Shizuku listeners: " + t.getMessage());
-                // leave flag false so we retry
             }
         }
     }
 
     private void initShizuku() {
         try {
-            // ── Sui path ──
             try {
                 isSui = Sui.init(context.getPackageName());
                 if (isSui) {
                     logger.i("✅ Sui detected — using Sui binder");
                     isAvailable = true;
-                    // Do NOT set isAuthorized here. Sui delivers its
-                    // binder through the same listener; checkPermission
-                    // will run from onBinderReceived.
                     return;
                 }
             } catch (NoClassDefFoundError e) {
@@ -204,35 +195,27 @@ public class ShizukuHelper {
                 isSui = false;
             }
 
-            // ── Package presence checks (metadata only) ──
-            realShizukuInstalled = isPackageInstalled(SHIZUKU_MANAGER_PACKAGE)
+            // Detect Shevery FIRST. Shevery ships a compat stub at the
+            // Shizuku package names, so if it's installed, "real Shizuku"
+            // detection will report it as installed too. We treat
+            // Shevery as the provider whenever it's present.
+            sheveryInstalled = isPackageInstalled(SHEVERY_PACKAGE);
+            realShizukuInstalled = !sheveryInstalled
+                                && isPackageInstalled(SHIZUKU_MANAGER_PACKAGE)
                                 && isPackageInstalled(SHIZUKU_API_PACKAGE);
-            sheveryInstalled     = isPackageInstalled(SHEVERY_PACKAGE);
 
             if (!realShizukuInstalled && !sheveryInstalled) {
                 logger.w("Shizuku/Shevery not installed");
-                logger.w("Install Shizuku from https://shizuku.rikka.app/");
-                logger.w("Or Shevery from " + SHEVERY_PACKAGE);
                 isAvailable = false;
                 return;
             }
 
-            if (realShizukuInstalled) logger.i("✅ Real Shizuku detected");
-            if (sheveryInstalled && !realShizukuInstalled) {
-                logger.w("⚠️ Shevery detected (no real Shizuku). Shevery's "
-                        + "legacy compat stub under " + SHIZUKU_API_PACKAGE
-                        + " may not reflect grants made in Shevery's UI. If "
-                        + "the grant fails to stick, use real Shizuku.");
-            } else if (sheveryInstalled) {
-                logger.w("⚠️ Both real Shizuku and Shevery are installed. "
-                        + "This can cause binder conflicts. Uninstall one.");
+            if (sheveryInstalled) {
+                logger.i("✅ Shevery detected (com.hamondev.shevery) — provider=Shevery(stub)");
+            } else if (realShizukuInstalled) {
+                logger.i("✅ Real Shizuku detected — provider=Shizuku");
             }
             logBinderProvenance();
-
-            // Note: we do NOT call Shizuku.pingBinder() here. The sticky
-            // listener already fired (or will fire) with the correct
-            // state. Calling pingBinder() before the provider delivers
-            // the binder returns false and would mark us unavailable.
 
         } catch (NoClassDefFoundError e) {
             logger.e("Shizuku API not found: " + e.getMessage());
@@ -252,10 +235,14 @@ public class ShizukuHelper {
         }
     }
 
+    /**
+     * Stable provider name. Shevery always wins when installed, because
+     * it ships a compat stub under the Shizuku package names — reporting
+     * "Shizuku" would be misleading.
+     */
     private String providerName() {
         if (isSui) return "Sui";
-        if (sheveryInstalled && !realShizukuInstalled) return "Shevery(stub)";
-        if (sheveryInstalled && realShizukuInstalled) return "Shevery+Shizuku";
+        if (sheveryInstalled) return "Shevery(stub)";
         return "Shizuku";
     }
 
@@ -270,56 +257,70 @@ public class ShizukuHelper {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // PERMISSION CHECK AND REQUEST
+    // PERMISSION CHECK
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Only called from the binder listener or via refreshFromBinder().
-     * Never called eagerly during construction.
-     */
-    private void checkPermission() {
+    private void markAuthorized(String source) {
+        boolean was = isAuthorized;
+        isAuthorized = true;
+        lastGrantTimestamp = System.currentTimeMillis();
+        if (!was) {
+            logger.i("markAuthorized (source=" + source
+                    + ", provider=" + providerName() + ")");
+        }
+    }
+
+    private void checkPermission(String source) {
         if (!isAvailable) {
-            logger.d("checkPermission: binder not available, skipping");
+            logger.d("checkPermission(" + source + "): binder not available, skipping");
             return;
         }
 
         try {
             int result = Shizuku.checkSelfPermission();
-            boolean wasAuthorized = isAuthorized;
-            isAuthorized = (result == PackageManager.PERMISSION_GRANTED);
+            boolean granted = (result == PackageManager.PERMISSION_GRANTED);
+            boolean was = isAuthorized;
 
-            if (isAuthorized) {
-                logger.i("✅ Shizuku permission GRANTED (provider=" + providerName() + ")");
-                if (!wasAuthorized) {
+            if (granted) {
+                markAuthorized(source);
+                if (!was) {
                     notifyPermissionGranted();
                     autoStartServiceIfPossible();
                 }
-            } else {
-                logger.w("⚠️ Shizuku permission NOT GRANTED (provider=" + providerName() + ")");
-                // Do NOT auto-request. The Application and MainActivity
-                // call requestPermission() explicitly when they want the
-                // dialog. Auto-request from a listener produces
-                // duplicate dialogs and races with the menu action.
+                return;
             }
-        } catch (Throwable e) {
-            logger.e("checkPermission failed: " + e.getMessage());
+
+            if (was) {
+                long sinceGrant = System.currentTimeMillis() - lastGrantTimestamp;
+                if (sinceGrant < GRANT_SETTLE_MS) {
+                    logger.w("checkPermission(" + source + "): transient DENIED "
+                            + "within settle window (" + sinceGrant + "ms since grant) "
+                            + "— keeping isAuthorized=true (provider=" + providerName() + ")");
+                    return;
+                }
+                logger.w("checkPermission(" + source + "): DENIED after settle window "
+                        + "(" + sinceGrant + "ms since grant) — downgrading");
+            } else {
+                logger.w("checkPermission(" + source + "): NOT GRANTED "
+                        + "(provider=" + providerName() + ")");
+            }
+
             isAuthorized = false;
+            lastGrantTimestamp = 0L;
+
+        } catch (Throwable e) {
+            logger.e("checkPermission(" + source + ") failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Public recheck. Call from onResume so returning from the Shizuku
-     * app refreshes our state.
-     */
     public void refreshFromBinder() {
-        if (isSui) {
-            checkPermission();
-            return;
-        }
         try {
+            if (isSui) {
+                checkPermission("refresh(Sui)");
+                return;
+            }
             if (!Shizuku.pingBinder()) {
                 isAvailable = false;
-                isAuthorized = false;
                 return;
             }
             isAvailable = true;
@@ -328,11 +329,15 @@ public class ShizukuHelper {
                     if (!Shizuku.isPreV11()) shizukuVersion = Shizuku.getVersion();
                 } catch (Throwable ignored) {}
             }
-            checkPermission();
+            checkPermission("refresh");
         } catch (Throwable t) {
             logger.e("refreshFromBinder failed: " + t.getMessage());
         }
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // PERMISSION REQUEST
+    // ═════════════════════════════════════════════════════════════
 
     public void requestPermission() {
         if (!isAvailable) {
@@ -365,16 +370,9 @@ public class ShizukuHelper {
         }
     }
 
-    /**
-     * Menu-driven "Grant Shizuku permission". Resets in-flight state
-     * and issues a fresh request so the dialog always appears. Safe
-     * to call repeatedly. Refreshes the binder state first in case the
-     * user already granted while we weren't looking.
-     */
     public void forceRequestPermission() {
         permissionRequestInFlight.set(false);
         grantToastShown.set(false);
-
         refreshFromBinder();
 
         if (isAuthorized) {
@@ -390,7 +388,7 @@ public class ShizukuHelper {
             return;
         }
 
-        logger.i("Force-requesting permission from menu (provider=" + providerName() + ")");
+        logger.i("Force-requesting permission (provider=" + providerName() + ")");
         requestPermission();
     }
 
@@ -451,33 +449,39 @@ public class ShizukuHelper {
     public int getVersion() { return shizukuVersion; }
     public boolean isSui() { return isSui; }
 
+    public boolean isAuthorizedFresh() {
+        try {
+            if (isSui) return isAuthorized;
+            if (!Shizuku.pingBinder()) return false;
+            int result = Shizuku.checkSelfPermission();
+            return result == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable t) {
+            logger.e("isAuthorizedFresh failed: " + t.getMessage());
+            return false;
+        }
+    }
+
     public boolean isSheveryInstalledPublic() { return sheveryInstalled; }
 
     public boolean refreshSheveryPresence() {
         sheveryInstalled = isPackageInstalled(SHEVERY_PACKAGE);
-        realShizukuInstalled = isPackageInstalled(SHIZUKU_MANAGER_PACKAGE)
+        realShizukuInstalled = !sheveryInstalled
+                            && isPackageInstalled(SHIZUKU_MANAGER_PACKAGE)
                             && isPackageInstalled(SHIZUKU_API_PACKAGE);
         return sheveryInstalled;
     }
 
-    /**
-     * True if the only provider present is Shevery's legacy stub under
-     * the original Shizuku package name. In this case, permission
-     * grants may not stick and the caller should surface a warning.
-     */
     public boolean isSheveryOnly() {
-        return sheveryInstalled && !realShizukuInstalled && !isSui;
+        return sheveryInstalled && !isSui;
     }
 
     public ShizukuStatus checkShizukuActive() {
         if (isSui) return ShizukuStatus.ACTIVE;
-
         boolean apiInstalled = isPackageInstalled(SHIZUKU_API_PACKAGE);
         boolean managerInstalled = isPackageInstalled(SHIZUKU_MANAGER_PACKAGE);
         boolean sheveryPresent = isPackageInstalled(SHEVERY_PACKAGE);
         sheveryInstalled = sheveryPresent;
-        realShizukuInstalled = managerInstalled && apiInstalled;
-
+        realShizukuInstalled = !sheveryPresent && managerInstalled && apiInstalled;
         if (!apiInstalled && !managerInstalled && !sheveryPresent) {
             return ShizukuStatus.NOT_INSTALLED;
         }
@@ -489,23 +493,25 @@ public class ShizukuHelper {
         return ShizukuStatus.NOT_ACTIVE;
     }
 
+    /**
+     * The single source of truth for the toolbar label.
+     */
     public String getStatusString() {
-        if (isSui) return "✅ Sui Active";
+        if (isSui) {
+            return isAuthorized
+                ? "🔑 Privileged (Sui)"
+                : "⚠️ Sui Active (Not Authorized)";
+        }
+
+        final String provider = providerName();
 
         if (!isAvailable()) {
-            if (sheveryInstalled && !realShizukuInstalled) return "❌ Shevery Not Active";
-            return "❌ Shizuku Not Available";
+            return "❌ " + provider + " Not Active";
         }
         if (!isAuthorized) {
-            if (sheveryInstalled && !realShizukuInstalled) {
-                return "⚠️ Shevery Available (Not Authorized — grant may not stick)";
-            }
-            return "⚠️ Shizuku Available (Not Authorized)";
+            return "⚠️ " + provider + " Available (Not Authorized)";
         }
-        if (sheveryInstalled && !realShizukuInstalled) {
-            return "✅ Shevery Authorized (v" + shizukuVersion + ")";
-        }
-        return "✅ Shizuku Authorized (v" + shizukuVersion + ")";
+        return "🔑 Privileged (" + provider + " v" + shizukuVersion + ")";
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -515,12 +521,10 @@ public class ShizukuHelper {
     public String getAppProcessBinary() {
         String cached = cachedAppProcessBinary;
         if (cached != null) return cached;
-
         if (!isAvailable() || !isAuthorized) {
             logger.d("Cannot probe app_process: not ready");
             return null;
         }
-
         for (String candidate : APP_PROCESS_CANDIDATES) {
             if (probeAppProcess(candidate)) {
                 cachedAppProcessBinary = candidate;
@@ -561,7 +565,6 @@ public class ShizukuHelper {
             result.exitCode = -1;
             return result;
         }
-
         Process process = null;
         try {
             process = spawnShellViaAidl(new String[]{"sh", "-c", command}, null, null);

@@ -21,13 +21,14 @@ android {
         applicationId "com.shizuposed.manager"
         minSdk 29
         targetSdk 37
-        versionCode 17
-        versionName "3.3"
+        versionCode 19
+        versionName "R-3.9"
 
         ndk {
-            // Only arm64 is supported by libshizuposed.so. Shipping other
-            // ABIs would produce an APK that installs on x86_64 emulators
-            // but whose native hooks silently fall through to Pine.
+            // Only arm64 is supported by the native engines. Shipping
+            // other ABIs would produce an APK that installs on x86_64
+            // emulators but whose native hooks silently fall through
+            // to Pine.
             abiFilters 'arm64-v8a'
         }
     }
@@ -86,22 +87,28 @@ android {
                 'META-INF/NOTICE.txt'
             ]
         }
-        // Keep libshizuposed.so uncompressed so dlopen can mmap it from
-        // the APK directly. NativeBridge.dispatchStubAddress() does
+        // Keep the native engines uncompressed so dlopen can mmap them
+        // from the APK directly. NativeBridge.dispatchStubAddress() does
         // dlsym("libshizuposed.so", ...) against the already-loaded lib;
         // if the loader extracted a compressed copy instead, that lookup
         // still works but costs an extraction on every process start.
+        // The same reasoning applies to libamiru.so, whose JNI_OnLoad
+        // runs a layout probe on first System.load.
         jniLibs {
             useLegacyPackaging = true
             // Belt-and-braces: if a future AGP version changes the
-            // default, keep the .so out of any compressor.
-            keepDebugSymbols += ['**/libshizuposed.so']
+            // default, keep the .so files out of any compressor.
+            keepDebugSymbols += [
+                '**/libshizuposed.so',
+                '**/libamiru.so'
+            ]
         }
     }
 
     // jniLibs is the default source dir, but we make it explicit so
-    // there's no ambiguity for anyone reading this file. The .so is
-    // built by `native/build-termux.sh` or the one-liner in the README.
+    // there's no ambiguity for anyone reading this file. The .so files
+    // are built by `native/build-termux.sh` or the one-liners in the
+    // README.
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jniLibs']
@@ -146,18 +153,22 @@ dependencies {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// libshizuposed.so presence check
+// Native library presence checks
 //
-// The native shim is built outside Gradle (clang one-liner, Termux-friendly).
-// This task fails the build early with a clear message if the .so is
-// missing, instead of letting the APK ship without it and NativeBackend
-// silently degrade to Pine-only.
+// The native engines are built outside Gradle (clang one-liners,
+// Termux-friendly). These tasks fail the build early with a clear
+// message if a .so is missing, instead of letting the APK ship without
+// it and the corresponding backend silently degrade.
+//
+// libshizuposed.so is required — NativeBackend depends on it.
+// libamiru.so is optional — AmiruBackend reports unavailable and the
+// dispatcher falls through if it is missing.
 //
 // Skip with: -PskipNativeCheck=true
 // ─────────────────────────────────────────────────────────────────────────
 
 tasks.register('checkNativeShim') {
-    description = 'Verify libshizuposed.so is present for arm64-v8a'
+    description = 'Verify libshizuposed.so is present for arm64-v8a (required)'
     group = 'verification'
 
     doLast {
@@ -188,9 +199,44 @@ tasks.register('checkNativeShim') {
     }
 }
 
+tasks.register('checkAmiru') {
+    description = 'Verify libamiru.so is present for arm64-v8a (optional)'
+    group = 'verification'
+
+    doLast {
+        if (project.hasProperty('skipNativeCheck')
+                && project.property('skipNativeCheck') == 'true') {
+            println "checkAmiru: skipped via -PskipNativeCheck=true"
+            return
+        }
+        def so = file('src/main/jniLibs/arm64-v8a/libamiru.so')
+        if (!so.exists()) {
+            logger.warn(
+                "libamiru.so not found at ${so.absolutePath}\n" +
+                "  Amiru will be unavailable and the dispatcher will fall\n" +
+                "  through to the existing native shim. To build it:\n" +
+                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
+                "        --target=aarch64-linux-android29 \\\n" +
+                "        -o app/src/main/jniLibs/arm64-v8a/libamiru.so \\\n" +
+                "        native/libamiru.c -llog -ldl\n" +
+                "  This is a warning, not an error — the build will proceed.")
+            return
+        }
+        def len = so.length()
+        if (len < 1024) {
+            logger.warn(
+                "libamiru.so at ${so.absolutePath} is only ${len} bytes — " +
+                "probably a failed or empty build. Amiru will be unavailable.")
+            return
+        }
+        println "checkAmiru: OK — ${len} bytes at ${so.absolutePath}"
+    }
+}
+
 tasks.matching { it.name == 'mergeDebugJniLibFolders' ||
                  it.name == 'mergeReleaseJniLibFolders' }.configureEach {
     dependsOn 'checkNativeShim'
+    dependsOn 'checkAmiru'
 }
 
 // ─────────────────────────────────────────────────────────────────────────

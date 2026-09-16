@@ -1,5 +1,6 @@
 package com.shizuposed.manager.ui;
 
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -53,15 +54,14 @@ public class HomeFragment extends Fragment {
     private TextView tvSystemVersion, tvDevice, tvSystemAbi;
 
     private Logger logger;
+    private ProcessMonitor processMonitor;
+    private ModuleLoader moduleLoader;
     private HookedProcessAdapter processAdapter;
     private List<HookedProcess> hookedProcesses = new ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private ProcessMonitor processMonitor;
-    private ModuleLoader moduleLoader;
 
-    // Shell uid is a platform constant: shell runs as uid 2000 on every
-    // Android build. Declared here so the value used in the UI and the
-    // value used anywhere else in the framework come from one place.
+    private volatile boolean viewReady = false;
+
     private static final String SHELL_PACKAGE = "com.android.shell";
     private static final int SHELL_UID = 2000;
 
@@ -73,18 +73,77 @@ public class HomeFragment extends Fragment {
         }
     };
 
+    // ═════════════════════════════════════════════════════════════
+    // LIFECYCLE
+    // ═════════════════════════════════════════════════════════════
+
+    @Override
+    public void onAttach(@NonNull Context context) {
+        super.onAttach(context);
+        logger = Logger.getInstance(context);
+        processMonitor = ProcessMonitor.getInstance(context);
+        moduleLoader = ModuleLoader.getInstance(context);
+    }
+
     @Nullable
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
                              @Nullable Bundle savedInstanceState) {
         View view = inflater.inflate(R.layout.fragment_home, container, false);
-
         initViews(view);
-        populateFrameworkInfo();   // static info, populated once
+        return view;
+    }
+
+    @Override
+    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+        super.onViewCreated(view, savedInstanceState);
+        viewReady = true;
+        populateFrameworkInfo();
         setupListeners();
         setupRecyclerView();
+        updateRealData();
+    }
 
-        return view;
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        viewReady = false;
+        mainHandler.removeCallbacks(statusUpdater);
+        processRecyclerView = null;
+        processAdapter = null;
+        progressIndicator = null;
+        tvStatus = null; tvHookedCount = null; tvTotalApps = null; tvActiveModules = null;
+        cardStatus = null;
+        btnRefresh = null; btnStartService = null;
+        tvFrameworkVersion = null; tvApiVersion = null;
+        tvShellPackage = null; tvShellUid = null;
+        tvSystemVersion = null; tvDevice = null; tvSystemAbi = null;
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        if (logger == null) return;
+        mainHandler.post(statusUpdater);
+        updateRealData();
+    }
+
+    @Override
+    public void onPause() {
+        super.onPause();
+        mainHandler.removeCallbacks(statusUpdater);
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // SAFE ENTRY POINTS
+    // ═════════════════════════════════════════════════════════════
+
+    public void refresh() {
+        if (!viewReady) {
+            if (logger != null) logger.d("refresh() skipped: view not ready");
+            return;
+        }
+        updateRealData();
     }
 
     private void initViews(View view) {
@@ -98,7 +157,6 @@ public class HomeFragment extends Fragment {
         btnRefresh = view.findViewById(R.id.btnRefresh);
         btnStartService = view.findViewById(R.id.btnStartService);
 
-        // Framework info card
         tvFrameworkVersion = view.findViewById(R.id.tvFrameworkVersion);
         tvApiVersion       = view.findViewById(R.id.tvApiVersion);
         tvShellPackage     = view.findViewById(R.id.tvShellPackage);
@@ -106,22 +164,12 @@ public class HomeFragment extends Fragment {
         tvSystemVersion    = view.findViewById(R.id.tvSystemVersion);
         tvDevice           = view.findViewById(R.id.tvDevice);
         tvSystemAbi        = view.findViewById(R.id.tvSystemAbi);
-
-        logger = Logger.getInstance(requireContext());
-        processMonitor = ProcessMonitor.getInstance(requireContext());
-        moduleLoader = ModuleLoader.getInstance(requireContext());
     }
 
-    // ═════════════════════════════════════════════════════════════
-    // FRAMEWORK INFO CARD
-    //
-    // Populated once. None of these values change at runtime.
-    // ═════════════════════════════════════════════════════════════
-
     private void populateFrameworkInfo() {
-        if (!isAdded() || getContext() == null) return;
+        if (!viewReady) return;
+        if (tvFrameworkVersion == null) return;
 
-        // 1. Framework version
         String frameworkVersion;
         try {
             frameworkVersion = LSPosedManager.getFrameworkName()
@@ -130,23 +178,14 @@ public class HomeFragment extends Fragment {
             frameworkVersion = "ShizuPosed";
         }
         tvFrameworkVersion.setText(frameworkVersion);
-
-        // 2. API version
-        int apiVersion = XposedBridge.getXposedVersion();
-        tvApiVersion.setText(String.valueOf(apiVersion));
-
-        // 3. Shell package + uid. This is the identity the hook payload
-        //    runs as, and the one that actually determines permissions.
-        //    Both values are platform constants.
+        tvApiVersion.setText(String.valueOf(XposedBridge.getXposedVersion()));
         tvShellPackage.setText(SHELL_PACKAGE);
         tvShellUid.setText(String.valueOf(SHELL_UID));
 
-        // 4. System version
         String systemVersion = "Android " + Build.VERSION.RELEASE
             + " (API " + Build.VERSION.SDK_INT + ")";
         tvSystemVersion.setText(systemVersion);
 
-        // 5. Device: manufacturer + model with capitalized manufacturer
         String manufacturer = Build.MANUFACTURER != null
             ? capitalize(Build.MANUFACTURER) : "";
         String model = Build.MODEL != null ? Build.MODEL : "";
@@ -154,7 +193,6 @@ public class HomeFragment extends Fragment {
         if (device.isEmpty()) device = "Unknown";
         tvDevice.setText(device);
 
-        // 6. System ABI
         String abi = "unknown";
         try {
             String[] abis = Build.SUPPORTED_ABIS;
@@ -162,12 +200,14 @@ public class HomeFragment extends Fragment {
         } catch (Throwable ignored) {}
         tvSystemAbi.setText(abi);
 
-        logger.d("Framework info: " + frameworkVersion
-            + ", API " + apiVersion
-            + ", shell " + SHELL_PACKAGE + " (uid " + SHELL_UID + ")"
-            + ", " + systemVersion
-            + ", " + device
-            + ", ABI " + abi);
+        if (logger != null) {
+            logger.d("Framework info: " + frameworkVersion
+                + ", API " + XposedBridge.getXposedVersion()
+                + ", shell " + SHELL_PACKAGE + " (uid " + SHELL_UID + ")"
+                + ", " + systemVersion
+                + ", " + device
+                + ", ABI " + abi);
+        }
     }
 
     private static String capitalize(String s) {
@@ -190,40 +230,28 @@ public class HomeFragment extends Fragment {
     }
 
     private void setupRecyclerView() {
+        if (processRecyclerView == null) return;
         processRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
         processAdapter = new HookedProcessAdapter(hookedProcesses, requireContext());
         processRecyclerView.setAdapter(processAdapter);
     }
 
     private void setupListeners() {
-        btnRefresh.setOnClickListener(v -> {
-            showLoading(true);
-            updateRealData();
-            showLoading(false);
-        });
-
-        btnStartService.setOnClickListener(v -> startService());
-    }
-
-    @Override
-    public void onResume() {
-        super.onResume();
-        mainHandler.post(statusUpdater);
-        updateRealData();
-    }
-
-    @Override
-    public void onPause() {
-        super.onPause();
-        mainHandler.removeCallbacks(statusUpdater);
-    }
-
-    public void refresh() {
-        updateRealData();
+        if (btnRefresh != null) {
+            btnRefresh.setOnClickListener(v -> {
+                showLoading(true);
+                updateRealData();
+                showLoading(false);
+            });
+        }
+        if (btnStartService != null) {
+            btnStartService.setOnClickListener(v -> startService());
+        }
     }
 
     private void updateRealData() {
-        if (!isAdded() || getContext() == null) return;
+        if (!viewReady) return;
+        if (logger == null || moduleLoader == null) return;
 
         ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
         boolean shizukuAuthorized = app != null && app.isShizukuAuthorized();
@@ -233,15 +261,14 @@ public class HomeFragment extends Fragment {
 
         updateStatus(shizukuAuthorized, serviceRunning);
 
-        int totalApps = getTotalInstalledApps();
-        tvTotalApps.setText(String.valueOf(totalApps));
-
-        int scopedApps = getScopedAppCount();
-        tvHookedCount.setText(String.valueOf(scopedApps));
-
-        int activeModules = getEnabledModuleCount();
+        if (tvTotalApps != null) {
+            tvTotalApps.setText(String.valueOf(getTotalInstalledApps()));
+        }
+        if (tvHookedCount != null) {
+            tvHookedCount.setText(String.valueOf(getScopedAppCount()));
+        }
         if (tvActiveModules != null) {
-            tvActiveModules.setText(String.valueOf(activeModules));
+            tvActiveModules.setText(String.valueOf(getEnabledModuleCount()));
         }
 
         List<HookedProcess> processes = (processMonitor != null)
@@ -263,14 +290,17 @@ public class HomeFragment extends Fragment {
             processAdapter.updateData(hookedProcesses);
         }
 
-        logger.d("Updated real data - Scoped: " + scopedApps
-            + ", Active modules: " + activeModules
-            + ", Apps: " + totalApps
+        logger.d("Updated real data - Scoped: " + getScopedAppCount()
+            + ", Active modules: " + getEnabledModuleCount()
+            + ", Apps: " + getTotalInstalledApps()
             + ", Shown processes: " + hookedProcesses.size()
             + ", Service: " + serviceRunning);
     }
 
     private void updateStatus(boolean shizukuAuthorized, boolean serviceRunning) {
+        if (tvStatus == null || cardStatus == null || btnStartService == null) return;
+        if (!isAdded()) return;
+
         if (!shizukuAuthorized) {
             tvStatus.setText("No Shizuku Permission");
             tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
@@ -298,12 +328,13 @@ public class HomeFragment extends Fragment {
             List<ApplicationInfo> apps = pm.getInstalledApplications(PackageManager.GET_META_DATA);
             return apps != null ? apps.size() : 0;
         } catch (Exception e) {
-            logger.e("Error getting total apps: " + e.getMessage());
+            if (logger != null) logger.e("Error getting total apps: " + e.getMessage());
             return 0;
         }
     }
 
     private int getScopedAppCount() {
+        if (moduleLoader == null) return 0;
         try {
             Set<String> union = new HashSet<>();
             for (ModuleInfo m : moduleLoader.getEnabledModules()) {
@@ -311,12 +342,13 @@ public class HomeFragment extends Fragment {
             }
             return union.size();
         } catch (Throwable t) {
-            logger.e("getScopedAppCount error: " + t.getMessage());
+            if (logger != null) logger.e("getScopedAppCount error: " + t.getMessage());
             return 0;
         }
     }
 
     private int getEnabledModuleCount() {
+        if (moduleLoader == null) return 0;
         try {
             return moduleLoader.getEnabledModules().size();
         } catch (Throwable t) {
@@ -325,16 +357,16 @@ public class HomeFragment extends Fragment {
     }
 
     private void startService() {
+        if (!isAdded() || getContext() == null) return;
         try {
             Intent serviceIntent = new Intent(requireContext(), ShizuPosedService.class);
             requireContext().startForegroundService(serviceIntent);
             Toast.makeText(requireContext(), "Service starting…", Toast.LENGTH_SHORT).show();
-            logger.i("Service started manually");
-
+            if (logger != null) logger.i("Service started manually");
             mainHandler.postDelayed(this::updateRealData, 1000);
         } catch (Exception e) {
             Toast.makeText(requireContext(), "Failed to start service", Toast.LENGTH_SHORT).show();
-            logger.e("Start service error: " + e.getMessage());
+            if (logger != null) logger.e("Start service error: " + e.getMessage());
         }
     }
 
@@ -342,11 +374,5 @@ public class HomeFragment extends Fragment {
         if (progressIndicator != null) {
             progressIndicator.setVisibility(show ? View.VISIBLE : View.GONE);
         }
-    }
-
-    @Override
-    public void onDestroyView() {
-        super.onDestroyView();
-        mainHandler.removeCallbacks(statusUpdater);
     }
 }

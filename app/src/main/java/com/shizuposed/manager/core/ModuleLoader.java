@@ -6,6 +6,8 @@ import android.content.pm.PackageManager;
 import androidx.annotation.Nullable;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.FileUtils;
@@ -35,13 +37,19 @@ import java.util.zip.ZipFile;
  *
  * Storage layout note:
  *
- *   The module JSONs live in app-internal storage (getFilesDir) because
- *   only the manager reads them.
+ *   The module JSONs live in app-internal storage (getFilesDir).
+ *   The module .dex copies live in EXTERNAL app storage so shell can
+ *   read them; shell cannot read /data/user/0/<our-pkg>/files/.
  *
- *   The module .dex copies live in EXTERNAL app storage
- *   (getExternalFilesDir) because the shell uid has to read them when
- *   pushing to /data/user/0/com.android.shell/files/. Shell cannot read
- *   anything under /data/user/0/<our-pkg>/files/ — SELinux forbids it.
+ * hasUi
+ * -----
+ * The Modules tab shows every module regardless of hasUi. The flag is
+ * consumed only by ModulesFragment's scope editor.
+ *
+ * loadModules() self-heals:
+ *   • If moduleDir is missing or is a file, it is recreated.
+ *   • If hasUi is false on disk, it is re-checked against the
+ *     PackageManager and corrected if wrong.
  */
 public class ModuleLoader {
     private static final String TAG = "ModuleLoader";
@@ -51,13 +59,8 @@ public class ModuleLoader {
     private final Logger logger;
     private final Gson gson;
 
-    // Module descriptors — internal storage, only the manager reads these
     private final File moduleDir;
-
-    // Module .dex copies — external app storage so shell can read them
     private final File dexCacheDir;
-
-    // Old internal dex cache — kept so we can migrate existing modules
     private final File legacyDexCacheDir;
 
     private final ConcurrentHashMap<String, ModuleInfo> loadedModules = new ConcurrentHashMap<>();
@@ -67,19 +70,16 @@ public class ModuleLoader {
         this.logger = Logger.getInstance(context);
         this.gson = new Gson();
 
-        // Internal: module JSON descriptors
         this.moduleDir = new File(context.getFilesDir(), ".syscall_cache/modules");
 
-        // External: module .dex copies (shell-readable)
         File external = context.getExternalFilesDir(null);
         File dexBase = external != null ? external : context.getFilesDir();
         this.dexCacheDir = new File(dexBase, ".syscall_cache");
 
-        // Old internal dex location — used only for one-time migration
         this.legacyDexCacheDir = new File(context.getFilesDir(), ".syscall_cache");
 
-        if (!moduleDir.exists()) moduleDir.mkdirs();
-        if (!dexCacheDir.exists()) dexCacheDir.mkdirs();
+        ensureDir(moduleDir);
+        ensureDir(dexCacheDir);
 
         migrateLegacyDexFiles();
     }
@@ -92,13 +92,30 @@ public class ModuleLoader {
     }
 
     /**
-     * Copy any .dex files sitting under the old internal path into
-     * external app storage so shell can read them. Runs once at startup;
-     * cheap because it only touches .dex files that exist.
+     * Create a directory if it doesn't exist, logging the result.
+     * mkdirs() can silently fail if the parent exists as a file, or if
+     * the path is unwritable. Logging makes that visible.
      */
+    private void ensureDir(File dir) {
+        if (dir == null) return;
+        if (dir.exists() && dir.isDirectory()) return;
+        if (dir.exists() && !dir.isDirectory()) {
+            logger.w("ensureDir: " + dir.getAbsolutePath()
+                + " exists as a file, deleting");
+            try { dir.delete(); } catch (Throwable ignored) {}
+        }
+        boolean ok = dir.mkdirs();
+        if (logger != null) {
+            logger.i("ensureDir: " + dir.getAbsolutePath()
+                + " created=" + ok
+                + " exists=" + dir.exists()
+                + " isDir=" + dir.isDirectory());
+        }
+    }
+
     private void migrateLegacyDexFiles() {
         try {
-            if (legacyDexCacheDir.equals(dexCacheDir)) return;   // no-op if external unavailable
+            if (legacyDexCacheDir.equals(dexCacheDir)) return;
             File[] files = legacyDexCacheDir.listFiles();
             if (files == null) return;
 
@@ -134,7 +151,23 @@ public class ModuleLoader {
         List<ModuleInfo> modules = new ArrayList<>();
 
         try {
+            // Self-heal: if the directory is missing or is a file, recreate.
+            if (!moduleDir.exists() || !moduleDir.isDirectory()) {
+                logger.w("loadModules: module dir missing, recreating: "
+                    + moduleDir.getAbsolutePath());
+                ensureDir(moduleDir);
+            }
+
             File[] moduleFiles = moduleDir.listFiles();
+
+            if (logger != null) {
+                logger.i("loadModules: dir=" + moduleDir.getAbsolutePath()
+                    + " exists=" + moduleDir.exists()
+                    + " isDir=" + moduleDir.isDirectory()
+                    + " fileCount=" + (moduleFiles == null
+                        ? "null" : String.valueOf(moduleFiles.length)));
+            }
+
             if (moduleFiles != null) {
                 loadedModules.clear();
                 for (File file : moduleFiles) {
@@ -145,9 +178,27 @@ public class ModuleLoader {
                         ModuleInfo module = gson.fromJson(json, ModuleInfo.class);
                         if (module == null || module.packageName == null) continue;
 
-                        // If cachedDexPath is missing or points at a file that
-                        // doesn't exist, look for one under the external cache
-                        // directory, then under the legacy internal one.
+                        // ── hasUi self-heal ──────────────────────────
+                        // Recompute hasUi whenever the field is missing
+                        // OR currently false. A false value may be stale
+                        // from an earlier build that used a weaker check.
+                        boolean currentHasUi = module.hasUi;
+                        if (!jsonHasField(json, "hasUi") || !currentHasUi) {
+                            module.hasUi = ModuleScanner.hasLauncherActivity(
+                                context, module.packageName);
+                            if (module.hasUi != currentHasUi) {
+                                try {
+                                    FileUtils.writeFile(file, gson.toJson(module));
+                                } catch (Throwable t) {
+                                    logger.w("hasUi writeback failed for "
+                                        + module.packageName + ": " + t.getMessage());
+                                }
+                                logger.i("Corrected hasUi for "
+                                    + module.packageName + " -> " + module.hasUi);
+                            }
+                        }
+
+                        // Fix cachedDexPath if it points at a missing file.
                         if (module.cachedDexPath == null
                                 || !new File(module.cachedDexPath).exists()) {
 
@@ -158,7 +209,6 @@ public class ModuleLoader {
                                 File legacyDex = new File(legacyDexCacheDir,
                                     module.packageName + ".dex");
                                 if (legacyDex.exists()) {
-                                    // Re-stage to external
                                     File dst = new File(dexCacheDir,
                                         module.packageName + ".dex");
                                     try (FileInputStream in = new FileInputStream(legacyDex);
@@ -174,8 +224,6 @@ public class ModuleLoader {
                             }
                         }
 
-                        // Also patch cachedDexPath if it points at an internal
-                        // file that no longer exists but an external copy does.
                         if (module.cachedDexPath != null) {
                             String cp = module.cachedDexPath;
                             String internalBase = context.getFilesDir().getAbsolutePath();
@@ -191,7 +239,8 @@ public class ModuleLoader {
                         loadedModules.put(module.packageName, module);
                         modules.add(module);
                     } catch (Exception e) {
-                        logger.e("Failed to load module from " + file.getName() + ": " + e.getMessage());
+                        logger.e("Failed to load module from " + file.getName()
+                            + ": " + e.getMessage());
                     }
                 }
             }
@@ -219,6 +268,11 @@ public class ModuleLoader {
         try {
             if (module == null || module.packageName == null) return false;
 
+            // Defensive: module dir should exist, but recreate if not.
+            if (!moduleDir.exists() || !moduleDir.isDirectory()) {
+                ensureDir(moduleDir);
+            }
+
             try {
                 PackageManager pm = context.getPackageManager();
                 android.content.pm.PackageInfo pkgInfo = pm.getPackageInfo(module.packageName, 0);
@@ -236,13 +290,18 @@ public class ModuleLoader {
                 if (fromPm != null) module.apkPath = fromPm;
             }
 
+            // Refresh hasUi on every install so module updates propagate.
+            try {
+                module.hasUi = ModuleScanner.hasLauncherActivity(
+                    context, module.packageName);
+            } catch (Throwable ignored) {}
+
             if (module.apkPath != null && new File(module.apkPath).exists()) {
                 File cachedDex = new File(dexCacheDir, module.packageName + ".dex");
                 if (!cachedDex.exists() || cachedDex.length() == 0) {
                     scanModuleForEntryPoints(module);
                 } else {
                     module.cachedDexPath = cachedDex.getAbsolutePath();
-                    // Make sure the external copy is shell-readable
                     cachedDex.setReadable(true, false);
                 }
             }
@@ -251,9 +310,16 @@ public class ModuleLoader {
             String json = gson.toJson(module);
             FileUtils.writeFile(moduleFile, json);
 
+            if (!moduleFile.exists() || moduleFile.length() == 0) {
+                logger.e("installModule: write produced no file at "
+                    + moduleFile.getAbsolutePath());
+                return false;
+            }
+
             loadedModules.put(module.packageName, module);
             logger.i("Installed module: " + module.packageName
-                + " (dex=" + module.cachedDexPath + ", entry=" + module.xposedInit + ")");
+                + " (dex=" + module.cachedDexPath + ", entry=" + module.xposedInit
+                + ", hasUi=" + module.hasUi + ")");
             return true;
         } catch (Exception e) {
             logger.e("Failed to install module: " + e.getMessage());
@@ -263,6 +329,10 @@ public class ModuleLoader {
 
     public boolean saveModule(ModuleInfo module) {
         try {
+            if (module == null || module.packageName == null) return false;
+            if (!moduleDir.exists() || !moduleDir.isDirectory()) {
+                ensureDir(moduleDir);
+            }
             File moduleFile = new File(moduleDir, module.packageName + ".json");
             String json = gson.toJson(module);
             FileUtils.writeFile(moduleFile, json);
@@ -289,7 +359,6 @@ public class ModuleLoader {
                 logger.w("Module not found in cache: " + packageName);
             }
 
-            // Delete both possible dex copies (external and legacy internal)
             File externalDex = new File(dexCacheDir, packageName + ".dex");
             if (externalDex.exists() && externalDex.delete()) {
                 logger.i("Deleted cached dex: " + externalDex.getAbsolutePath());
@@ -366,9 +435,6 @@ public class ModuleLoader {
             return;
         }
 
-        // Copy APK bytes into the external dex cache. This is what the
-        // shell process will load via DexClassLoader; the whole APK is
-        // a valid dex container, so we don't need to extract classes.dex.
         try {
             File cached = new File(dexCacheDir, module.packageName + ".dex");
             if (!cached.exists() || cached.length() == 0) {
@@ -433,5 +499,19 @@ public class ModuleLoader {
             logger.e("findModuleApkPath(" + packageName + "): " + e.getMessage());
         }
         return null;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // JSON HELPERS
+    // ═════════════════════════════════════════════════════════════════
+
+    private static boolean jsonHasField(String json, String field) {
+        if (json == null || field == null) return false;
+        try {
+            JsonObject obj = JsonParser.parseString(json).getAsJsonObject();
+            return obj.has(field);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 }

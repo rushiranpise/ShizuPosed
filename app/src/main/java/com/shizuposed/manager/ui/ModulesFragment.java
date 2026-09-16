@@ -1,6 +1,7 @@
 package com.shizuposed.manager.ui;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -56,6 +57,22 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * ModulesFragment
+ *
+ * Shows every installed Xposed module — same list as R-3.6. No
+ * filtering, no hiding.
+ *
+ * The only behavior that differs from R-3.6 is inside the scope
+ * editor (Select Apps dialog): a module whose APK declares a
+ * launcher activity can select its OWN package as a hook target, so
+ * it can be launched under ShizuPosed and hook itself. Headless
+ * modules do not see their own package, matching R-3.6.
+ *
+ * The self-scope decision is made LIVE against the PackageManager
+ * every time the dialog opens. It does not trust the persisted
+ * hasUi flag, which may be stale or wrong.
+ */
 public class ModulesFragment extends Fragment {
     private RecyclerView moduleRecyclerView;
     private ProgressBar progressIndicator;
@@ -66,9 +83,10 @@ public class ModulesFragment extends Fragment {
     private ModuleLoader moduleLoader;
     private Logger logger;
     private ShizukuHelper shizukuHelper;
+    private PackageManager packageManager;
+
     private List<ModuleInfo> modules = new ArrayList<>();
     private ModuleAdapter moduleAdapter;
-    private PackageManager packageManager;
 
     private AlertDialog addModuleDialog = null;
     private AlertDialog selectAppsDialog = null;
@@ -86,9 +104,11 @@ public class ModulesFragment extends Fragment {
     private static final long TOGGLE_DEBOUNCE = 500;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService scannerExecutor = Executors.newSingleThreadExecutor();
+
+    private ExecutorService scannerExecutor = null;
 
     private volatile boolean scanInProgress = false;
+    private volatile boolean viewReady = false;
 
     private final ActivityResultLauncher<Intent> filePickerLauncher =
         registerForActivityResult(new ActivityResultContracts.StartActivityForResult(),
@@ -97,35 +117,91 @@ public class ModulesFragment extends Fragment {
                 public void onActivityResult(ActivityResult result) {
                     isFilePickerActive = false;
                     if (!isAdded() || getContext() == null) return;
+                    if (!viewReady) return;
                     if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
                         Intent data = result.getData();
                         Uri uri = data.getData();
                         if (uri != null) handleSelectedApk(uri);
                     } else {
-                        Toast.makeText(requireContext(), "No file selected", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(requireContext(), "No file selected",
+                                Toast.LENGTH_SHORT).show();
                     }
                 }
             });
+
+    @Override
+    public void onAttach(@NonNull Context context) {
+        super.onAttach(context);
+        packageManager = context.getPackageManager();
+        logger = Logger.getInstance(context);
+        moduleLoader = ModuleLoader.getInstance(context);
+        shizukuHelper = ShizukuHelper.getInstance(context);
+    }
+
+    @Override
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        scannerExecutor = Executors.newSingleThreadExecutor();
+    }
 
     @Nullable
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
                              @Nullable Bundle savedInstanceState) {
-        View view = inflater.inflate(R.layout.fragment_modules, container, false);
+        return inflater.inflate(R.layout.fragment_modules, container, false);
+    }
 
-        packageManager = requireContext().getPackageManager();
-        logger = Logger.getInstance(requireContext());
-        moduleLoader = ModuleLoader.getInstance(requireContext());
-        shizukuHelper = ShizukuHelper.getInstance(requireContext());
-
+    @Override
+    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+        super.onViewCreated(view, savedInstanceState);
+        viewReady = true;
         initViews(view);
         setupRecyclerView();
         setupListeners();
-
         loadModules();
         startBackgroundScan();
+    }
 
-        return view;
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        viewReady = false;
+        dismissAllDialogs();
+        addModuleDialog = null;
+        selectAppsDialog = null;
+        confirmDialog = null;
+        isFilePickerActive = false;
+        moduleRecyclerView = null;
+        progressIndicator = null;
+        fabAddModule = null;
+        searchView = null;
+        tvEmptyState = null;
+        moduleAdapter = null;
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        if (scannerExecutor != null) {
+            scannerExecutor.shutdownNow();
+            scannerExecutor = null;
+        }
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        if (!viewReady) return;
+        loadModules();
+        startBackgroundScan();
+    }
+
+    public void refresh() {
+        if (!viewReady) {
+            if (logger != null) logger.d("refresh() skipped: view not ready");
+            return;
+        }
+        loadModules();
     }
 
     private void initViews(View view) {
@@ -137,6 +213,7 @@ public class ModulesFragment extends Fragment {
     }
 
     private void setupRecyclerView() {
+        if (moduleRecyclerView == null) return;
         moduleAdapter = new ModuleAdapter(modules, requireContext());
         moduleAdapter.setOnModuleActionListener(new ModuleAdapter.OnModuleActionListener() {
             @Override public void onToggle(ModuleInfo module, boolean enable) { toggleModule(module, enable); }
@@ -144,22 +221,26 @@ public class ModulesFragment extends Fragment {
             @Override public void onUninstall(ModuleInfo module) { uninstallModule(module); }
             @Override public void onSelectApps(ModuleInfo module) { showSelectAppsDialog(module); }
         });
-
         moduleRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
         moduleRecyclerView.setAdapter(moduleAdapter);
     }
 
     private void setupListeners() {
-        fabAddModule.setOnClickListener(v -> {
-            dismissAllDialogs();
-            showAddModuleDialog();
-        });
-
-        searchView.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { filterModules(s.toString()); }
-            @Override public void afterTextChanged(Editable s) {}
-        });
+        if (fabAddModule != null) {
+            fabAddModule.setOnClickListener(v -> {
+                dismissAllDialogs();
+                showAddModuleDialog();
+            });
+        }
+        if (searchView != null) {
+            searchView.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+                @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                    filterModules(s.toString());
+                }
+                @Override public void afterTextChanged(Editable s) {}
+            });
+        }
     }
 
     private void dismissAllDialogs() {
@@ -168,21 +249,15 @@ public class ModulesFragment extends Fragment {
         if (confirmDialog != null && confirmDialog.isShowing()) confirmDialog.dismiss();
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // MODULE AUTO-DETECTION + PURGE
-    // ═════════════════════════════════════════════════════════════════
-
-    /**
-     * Scan installed packages for Xposed modules in the background.
-     * The scan also purges any module whose APK was removed externally
-     * (e.g. via Settings → Apps), so uninstalling a module that way
-     * cleans it out of the Modules tab on the next scan.
-     */
     private void startBackgroundScan() {
-        if (scanInProgress) return;
+        if (!viewReady || scanInProgress) return;
+        if (scannerExecutor == null || scannerExecutor.isShutdown()) {
+            if (logger != null) logger.d("startBackgroundScan: executor not available");
+            return;
+        }
         scanInProgress = true;
 
-        final android.content.Context appCtx = requireContext().getApplicationContext();
+        final Context appCtx = requireContext().getApplicationContext();
         scannerExecutor.execute(() -> {
             try {
                 ModuleScanner.ScanResult result =
@@ -191,63 +266,86 @@ public class ModulesFragment extends Fragment {
                 if (!isAdded()) return;
                 mainHandler.post(() -> {
                     scanInProgress = false;
+                    if (!viewReady) return;
                     loadModules();
 
-                    if (getView() == null) return;
+                    View v = getView();
+                    if (v == null) return;
 
                     int newCount = result.newlyRegistered;
                     int purged = result.purgedCount;
 
                     if (purged > 0 && newCount > 0) {
-                        Snackbar.make(getView(),
+                        Snackbar.make(v,
                             purged + " removed, " + newCount + " added",
                             Snackbar.LENGTH_LONG).show();
                     } else if (purged > 0) {
-                        Snackbar.make(getView(),
-                            purged + " module"
-                                + (purged != 1 ? "s" : "") + " removed",
+                        Snackbar.make(v,
+                            purged + " module" + (purged != 1 ? "s" : "") + " removed",
                             Snackbar.LENGTH_LONG).show();
                     } else if (newCount > 0) {
-                        Snackbar.make(getView(),
-                            newCount + " new module"
-                                + (newCount != 1 ? "s" : "") + " detected",
+                        Snackbar.make(v,
+                            newCount + " new module" + (newCount != 1 ? "s" : "") + " detected",
                             Snackbar.LENGTH_LONG).show();
                     }
                 });
             } catch (Throwable t) {
                 scanInProgress = false;
                 if (isAdded()) {
-                    mainHandler.post(() -> logger.w("Module scan failed: " + t.getMessage()));
+                    mainHandler.post(() -> {
+                        if (logger != null) logger.w("Module scan failed: " + t.getMessage());
+                    });
                 }
             }
         });
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // LOAD / FILTER
-    // ═════════════════════════════════════════════════════════════════
-
     private void loadModules() {
+        if (!viewReady) return;
+        if (moduleLoader == null) {
+            if (logger != null) logger.w("loadModules: moduleLoader is null");
+            return;
+        }
+        if (moduleAdapter == null) {
+            if (logger != null) logger.w("loadModules: adapter not ready");
+            return;
+        }
+
         showLoading(true);
         try {
             modules = moduleLoader.loadModules();
+
+            if (modules == null || modules.isEmpty()) {
+                if (logger != null) {
+                    logger.i("loadModules: empty, running synchronous scan");
+                }
+                try {
+                    ModuleScanner.scanInstalledModules(requireContext());
+                    modules = moduleLoader.loadModules();
+                } catch (Throwable t) {
+                    if (logger != null) logger.w("Synchronous scan failed: " + t.getMessage());
+                }
+            }
+
             moduleAdapter.updateData(modules);
 
-            if (modules.isEmpty()) {
-                tvEmptyState.setVisibility(View.VISIBLE);
-                moduleRecyclerView.setVisibility(View.GONE);
-            } else {
-                tvEmptyState.setVisibility(View.GONE);
-                moduleRecyclerView.setVisibility(View.VISIBLE);
+            if (tvEmptyState != null) {
+                tvEmptyState.setVisibility(modules.isEmpty() ? View.VISIBLE : View.GONE);
             }
-            logger.i("Loaded " + modules.size() + " modules");
+            if (moduleRecyclerView != null) {
+                moduleRecyclerView.setVisibility(modules.isEmpty() ? View.GONE : View.VISIBLE);
+            }
+            if (logger != null) {
+                logger.i("loadModules: final count = " + modules.size());
+            }
         } catch (Exception e) {
-            logger.e("Error loading modules: " + e.getMessage());
+            if (logger != null) logger.e("loadModules error: " + e.getMessage());
         }
         showLoading(false);
     }
 
     private void filterModules(String query) {
+        if (!viewReady || moduleAdapter == null) return;
         if (query == null || query.isEmpty()) {
             moduleAdapter.updateData(modules);
             return;
@@ -255,6 +353,7 @@ public class ModulesFragment extends Fragment {
         List<ModuleInfo> filtered = new ArrayList<>();
         String lowerQuery = query.toLowerCase();
         for (ModuleInfo module : modules) {
+            if (module == null || module.packageName == null) continue;
             if (module.packageName.toLowerCase().contains(lowerQuery) ||
                 (module.name != null && module.name.toLowerCase().contains(lowerQuery))) {
                 filtered.add(module);
@@ -263,66 +362,54 @@ public class ModulesFragment extends Fragment {
         moduleAdapter.updateData(filtered);
     }
 
-    /**
-     * Update the RecyclerView row for a module, matching by package name.
-     */
     private void updateModuleRow(ModuleInfo updated) {
-        if (updated == null || updated.packageName == null) return;
-
+        if (!viewReady || updated == null || updated.packageName == null) return;
         for (int i = 0; i < modules.size(); i++) {
             ModuleInfo existing = modules.get(i);
-            if (existing != null
-                    && updated.packageName.equals(existing.packageName)) {
+            if (existing != null && updated.packageName.equals(existing.packageName)) {
                 modules.set(i, updated);
-                if (moduleAdapter != null) {
-                    moduleAdapter.notifyItemChanged(i);
-                }
+                if (moduleAdapter != null) moduleAdapter.notifyItemChanged(i);
                 return;
             }
         }
-
         loadModules();
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // SERVICE SYNC
-    // ═════════════════════════════════════════════════════════════════
-
     public void requestModuleRepush(String reason) {
+        if (!isAdded() || getContext() == null) return;
         try {
             if (!ShizuPosedService.isServiceRunning()) {
-                logger.d("Service not running — skipping repush (" + reason + ")");
+                if (logger != null) logger.d("Service not running — skipping repush (" + reason + ")");
                 return;
             }
             Intent i = new Intent(requireContext(), ShizuPosedService.class);
             i.setAction(ShizuPosedService.ACTION_REPUSH_MODULES);
             requireContext().startForegroundService(i);
-            logger.d("Requested module repush: " + reason);
+            if (logger != null) logger.d("Requested module repush: " + reason);
         } catch (Throwable t) {
-            logger.w("requestModuleRepush failed: " + t.getMessage());
+            if (logger != null) logger.w("requestModuleRepush failed: " + t.getMessage());
         }
     }
 
     private void notifyProviderChanged(String packageName, boolean enabled) {
+        if (!isAdded() || getContext() == null) return;
         try {
             if (packageName != null) {
                 requireContext().getContentResolver().notifyChange(
                     com.shizuposed.manager.status.ModuleStatusProvider
-                        .moduleUri(packageName),
-                    null);
+                        .moduleUri(packageName), null);
             }
             requireContext().getContentResolver().notifyChange(
-                com.shizuposed.manager.status.ModuleStatusProvider.MODULES_URI,
-                null);
+                com.shizuposed.manager.status.ModuleStatusProvider.MODULES_URI, null);
             requireContext().getContentResolver().notifyChange(
-                com.shizuposed.manager.status.ModuleStatusProvider.INFO_URI,
-                null);
+                com.shizuposed.manager.status.ModuleStatusProvider.INFO_URI, null);
         } catch (Throwable t) {
-            logger.d("notifyChange failed: " + t.getMessage());
+            if (logger != null) logger.d("notifyChange failed: " + t.getMessage());
         }
     }
 
     private void broadcastModuleStateChange(ModuleInfo module) {
+        if (!isAdded() || getContext() == null) return;
         if (module == null || module.packageName == null) return;
         try {
             Intent i = new Intent(module.enabled
@@ -331,10 +418,10 @@ public class ModulesFragment extends Fragment {
             i.putExtra("module", module.packageName);
             i.setPackage(module.packageName);
             requireContext().sendBroadcast(i);
-            logger.d("Broadcast module state: " + module.packageName
-                + " -> " + module.enabled);
+            if (logger != null) logger.d("Broadcast module state: "
+                    + module.packageName + " -> " + module.enabled);
         } catch (Throwable t) {
-            logger.w("broadcastModuleStateChange failed: " + t.getMessage());
+            if (logger != null) logger.w("broadcastModuleStateChange failed: " + t.getMessage());
         }
     }
 
@@ -344,51 +431,48 @@ public class ModulesFragment extends Fragment {
         broadcastModuleStateChange(module);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // TOGGLE
-    // ═════════════════════════════════════════════════════════════════
-
     private void toggleModule(ModuleInfo module, boolean enable) {
         long now = System.currentTimeMillis();
         if (now - lastToggleTime < TOGGLE_DEBOUNCE) return;
         lastToggleTime = now;
 
+        if (moduleLoader == null || module == null) return;
         try {
             module.enabled = enable;
             moduleLoader.saveModule(module);
 
             String msg = enable ? "Module enabled" : "Module disabled";
-            Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show();
-            logger.i(msg + ": " + module.packageName);
+            if (isAdded()) {
+                Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show();
+            }
+            if (logger != null) logger.i(msg + ": " + module.packageName);
 
             updateModuleRow(module);
-
             requestModuleRepush("toggle " + module.packageName + " -> " + enable);
             announceModuleStateChange(module);
         } catch (Exception e) {
-            Toast.makeText(requireContext(), "Failed to toggle module: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-            logger.e("Toggle error: " + e.getMessage());
+            if (isAdded()) {
+                Toast.makeText(requireContext(), "Failed to toggle module: " + e.getMessage(),
+                        Toast.LENGTH_SHORT).show();
+            }
+            if (logger != null) logger.e("Toggle error: " + e.getMessage());
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // MODULE DETAIL
-    // ═════════════════════════════════════════════════════════════════
-
     private void showModuleDetail(ModuleInfo module) {
         if (module == null || module.packageName == null) return;
+        if (!isAdded()) return;
         ModuleDetailSheet sheet = ModuleDetailSheet.newInstance(module.packageName);
         sheet.show(getParentFragmentManager(), "module_detail");
     }
 
     public void onModuleUpdated(ModuleInfo updated) {
-        if (updated == null) return;
-
+        if (!viewReady || updated == null) return;
         for (int i = 0; i < modules.size(); i++) {
             ModuleInfo existing = modules.get(i);
             if (existing != null && updated.packageName.equals(existing.packageName)) {
                 modules.set(i, updated);
-                moduleAdapter.notifyItemChanged(i);
+                if (moduleAdapter != null) moduleAdapter.notifyItemChanged(i);
                 break;
             }
         }
@@ -397,19 +481,19 @@ public class ModulesFragment extends Fragment {
     }
 
     public void onModuleRemoved(String packageName) {
-        if (packageName == null) return;
+        if (!viewReady || packageName == null) return;
         for (int i = 0; i < modules.size(); i++) {
             ModuleInfo existing = modules.get(i);
             if (existing != null && packageName.equals(existing.packageName)) {
                 modules.remove(i);
-                moduleAdapter.notifyItemRemoved(i);
+                if (moduleAdapter != null) moduleAdapter.notifyItemRemoved(i);
                 break;
             }
         }
 
         if (modules.isEmpty()) {
-            tvEmptyState.setVisibility(View.VISIBLE);
-            moduleRecyclerView.setVisibility(View.GONE);
+            if (tvEmptyState != null) tvEmptyState.setVisibility(View.VISIBLE);
+            if (moduleRecyclerView != null) moduleRecyclerView.setVisibility(View.GONE);
         }
         requestModuleRepush("removed " + packageName);
 
@@ -417,78 +501,72 @@ public class ModulesFragment extends Fragment {
             Intent i = new Intent("de.robv.android.xposed.action.MODULE_DISABLED");
             i.putExtra("module", packageName);
             i.setPackage(packageName);
-            requireContext().sendBroadcast(i);
+            if (isAdded()) requireContext().sendBroadcast(i);
         } catch (Throwable ignored) {}
         notifyProviderChanged(packageName, false);
     }
 
     public void launchUnderShizuPosed(String packageName) {
         if (packageName == null) return;
-
-        if (!shizukuHelper.isAvailable() || !shizukuHelper.isAuthorized()) {
+        if (!isAdded()) return;
+        if (shizukuHelper == null || !shizukuHelper.isAvailable() || !shizukuHelper.isAuthorized()) {
             Toast.makeText(requireContext(),
                 "Shizuku not available or not authorized", Toast.LENGTH_LONG).show();
             return;
         }
-
         try {
             Intent svc = new Intent(requireContext(), ShizuPosedService.class);
             svc.setAction(ShizuPosedService.ACTION_LAUNCH_APP);
             svc.putExtra(ShizuPosedService.EXTRA_LAUNCH_PACKAGE, packageName);
             requireContext().startForegroundService(svc);
-
             Toast.makeText(requireContext(),
                 "Launching " + packageName + " under ShizuPosed…",
                 Toast.LENGTH_SHORT).show();
-            logger.i("Requested launch under ShizuPosed: " + packageName);
+            if (logger != null) logger.i("Requested launch under ShizuPosed: " + packageName);
         } catch (Throwable t) {
             Toast.makeText(requireContext(),
-                "Failed to launch: " + t.getMessage(),
-                Toast.LENGTH_LONG).show();
-            logger.e("launchUnderShizuPosed failed: " + t.getMessage());
+                "Failed to launch: " + t.getMessage(), Toast.LENGTH_LONG).show();
+            if (logger != null) logger.e("launchUnderShizuPosed failed: " + t.getMessage());
         }
     }
 
     public void openScopeEditor(ModuleInfo module) {
-        if (module == null) return;
+        if (module == null || !isAdded() || !viewReady) return;
         showSelectAppsDialog(module);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // UNINSTALL
-    // ═════════════════════════════════════════════════════════════════
-
     public void uninstallModule(ModuleInfo module) {
+        if (module == null || !isAdded() || !viewReady) return;
         confirmDialog = new AlertDialog.Builder(requireContext())
             .setTitle("Uninstall Module")
             .setMessage("Remove " + (module.name != null ? module.name : module.packageName)
                 + " from ShizuPosed?\n\nThe module APK itself is not touched.")
             .setPositiveButton("Remove", (dialog, which) -> {
+                if (moduleLoader == null) return;
                 try {
                     boolean removed = moduleLoader.uninstallModule(module.packageName);
                     if (removed) {
                         onModuleRemoved(module.packageName);
-                        Toast.makeText(requireContext(), "Removed from ShizuPosed", Toast.LENGTH_SHORT).show();
-                        logger.i("Removed module: " + module.packageName);
+                        if (isAdded()) Toast.makeText(requireContext(),
+                            "Removed from ShizuPosed", Toast.LENGTH_SHORT).show();
+                        if (logger != null) logger.i("Removed module: " + module.packageName);
                     } else {
-                        Toast.makeText(requireContext(), "Failed to remove", Toast.LENGTH_SHORT).show();
+                        if (isAdded()) Toast.makeText(requireContext(),
+                            "Failed to remove", Toast.LENGTH_SHORT).show();
                     }
                 } catch (Exception e) {
-                    Toast.makeText(requireContext(), "Failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-                    logger.e("Uninstall error: " + e.getMessage());
+                    if (isAdded()) Toast.makeText(requireContext(),
+                        "Failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                    if (logger != null) logger.e("Uninstall error: " + e.getMessage());
                 }
             })
             .setNegativeButton("Cancel", null)
             .create();
-
         confirmDialog.show();
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // SELECT APPS DIALOG
-    // ═════════════════════════════════════════════════════════════════
-
     public void showSelectAppsDialog(ModuleInfo module) {
+        if (module == null || !isAdded() || getContext() == null) return;
         if (selectAppsDialog != null && selectAppsDialog.isShowing()) {
             selectAppsDialog.dismiss();
         }
@@ -505,13 +583,14 @@ public class ModulesFragment extends Fragment {
         TextView tvSelectedCount = dialogView.findViewById(R.id.tvSelectedCount);
         CheckBox cbHideSystem = dialogView.findViewById(R.id.cbHideSystem);
 
-        List<ApplicationInfo> allApps = getInstalledApps();
+        // Pass the module's package to getInstalledApps(). The list it
+        // returns includes this module's own entry if and only if the
+        // module has a launcher activity.
+        List<ApplicationInfo> allApps = getInstalledApps(module.packageName);
 
         List<ApplicationInfo> userApps = new ArrayList<>();
-        List<ApplicationInfo> systemApps = new ArrayList<>();
         for (ApplicationInfo app : allApps) {
-            if ((app.flags & ApplicationInfo.FLAG_SYSTEM) != 0) systemApps.add(app);
-            else userApps.add(app);
+            if ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0) userApps.add(app);
         }
 
         final List<ApplicationInfo> source = new ArrayList<>(userApps);
@@ -526,13 +605,15 @@ public class ModulesFragment extends Fragment {
             adapter.setOnSelectionChangedListener(count ->
                 tvSelectedCount.setText(count + " selected"));
         }
-
         adapter.setSelectedApps(currentSelection);
 
-        appRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
-        appRecyclerView.setAdapter(adapter);
+        if (appRecyclerView != null) {
+            appRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
+            appRecyclerView.setAdapter(adapter);
+        }
 
         final Runnable reapply = () -> {
+            if (etSearchApps == null) return;
             String query = etSearchApps.getText().toString().toLowerCase().trim();
             List<ApplicationInfo> filtered = new ArrayList<>();
             for (ApplicationInfo app : source) {
@@ -557,40 +638,41 @@ public class ModulesFragment extends Fragment {
             source.addAll(allApps);
         }
 
-        etSearchApps.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int i, int c, int a) {}
-            @Override public void onTextChanged(CharSequence s, int i, int b, int c) { reapply.run(); }
-            @Override public void afterTextChanged(Editable s) {}
-        });
+        if (etSearchApps != null) {
+            etSearchApps.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int i, int c, int a) {}
+                @Override public void onTextChanged(CharSequence s, int i, int b, int c) { reapply.run(); }
+                @Override public void afterTextChanged(Editable s) {}
+            });
+        }
 
         reapply.run();
 
-        btnSelectAll.setOnClickListener(v -> adapter.selectAll());
-        btnClearAll.setOnClickListener(v -> adapter.clearAll());
-        btnSelectSystem.setOnClickListener(v -> {
-            if (cbHideSystem != null && cbHideSystem.isChecked()) {
-                cbHideSystem.setChecked(false);
-            }
-            adapter.selectSystemApps();
-        });
-
-        btnApply.setVisibility(View.GONE);
+        if (btnSelectAll != null) btnSelectAll.setOnClickListener(v -> adapter.selectAll());
+        if (btnClearAll != null) btnClearAll.setOnClickListener(v -> adapter.clearAll());
+        if (btnSelectSystem != null) {
+            btnSelectSystem.setOnClickListener(v -> {
+                if (cbHideSystem != null && cbHideSystem.isChecked()) {
+                    cbHideSystem.setChecked(false);
+                }
+                adapter.selectSystemApps();
+            });
+        }
+        if (btnApply != null) btnApply.setVisibility(View.GONE);
 
         selectAppsDialog = new AlertDialog.Builder(requireContext())
             .setTitle("Select Apps for " + module.name)
             .setView(dialogView)
             .setPositiveButton("Apply", (d, w) -> {
+                if (moduleLoader == null) return;
                 Set<String> selected = adapter.getSelectedApps();
                 module.hookedApps = selected;
                 moduleLoader.saveModule(module);
-
                 updateModuleRow(module);
-
                 int count = selected.size();
                 String msg = count + " app" + (count != 1 ? "s" : "") + " selected";
-                Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show();
-                logger.i(msg + " for " + module.name);
-
+                if (isAdded()) Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show();
+                if (logger != null) logger.i(msg + " for " + module.name);
                 requestModuleRepush("selectApps " + module.packageName + " -> " + count);
                 announceModuleStateChange(module);
             })
@@ -603,73 +685,84 @@ public class ModulesFragment extends Fragment {
     }
 
     /**
-     * Enumerate every hookable app.
+     * Returns the list of apps to display in the scope editor.
+     *
+     * Self-scope rule:
+     *   • Every non-module installed app is included.
+     *   • The module whose scope is being edited is INCLUDED if and
+     *     only if the PackageManager reports it has a launcher
+     *     activity. This is checked LIVE at dialog-open time; the
+     *     persisted hasUi flag is not trusted.
+     *   • Every other module package stays excluded.
+     *   • The manager itself (ShizuPosed) is never included.
      */
-    private List<ApplicationInfo> getInstalledApps() {
+    private List<ApplicationInfo> getInstalledApps(String selfPackage) {
+        if (packageManager == null) return new ArrayList<>();
         try {
-            try { moduleLoader.loadModules(); } catch (Throwable ignored) {}
+            if (moduleLoader != null) {
+                try { moduleLoader.loadModules(); } catch (Throwable ignored) {}
+            }
 
             List<ApplicationInfo> all = packageManager.getInstalledApplications(
-                PackageManager.GET_META_DATA | PackageManager.MATCH_DISABLED_COMPONENTS
-            );
+                PackageManager.GET_META_DATA | PackageManager.MATCH_DISABLED_COMPONENTS);
             if (all == null) return new ArrayList<>();
 
-            String self = requireContext().getPackageName();
+            String managerSelf = requireContext().getPackageName();
 
             Set<String> modulePackages = new HashSet<>();
             try {
-                for (ModuleInfo m : moduleLoader.getCachedModules()) {
-                    if (m != null && m.packageName != null) {
-                        modulePackages.add(m.packageName);
+                if (moduleLoader != null) {
+                    for (ModuleInfo m : moduleLoader.getCachedModules()) {
+                        if (m != null && m.packageName != null) modulePackages.add(m.packageName);
                     }
                 }
             } catch (Throwable t) {
-                logger.w("Could not read module list: " + t.getMessage());
+                if (logger != null) logger.w("Could not read module list: " + t.getMessage());
+            }
+
+            // Live check against PackageManager. Do not trust the
+            // persisted hasUi flag — it may be stale or missing.
+            boolean allowSelf = selfPackage != null
+                && ModuleScanner.hasLauncherActivity(requireContext(), selfPackage);
+
+            if (logger != null) {
+                logger.i("getInstalledApps: selfPackage=" + selfPackage
+                    + " allowSelf=" + allowSelf
+                    + " modulePackages=" + modulePackages.size());
             }
 
             List<ApplicationInfo> filtered = new ArrayList<>(all.size());
-            int skippedSelf = 0;
-            int skippedModules = 0;
             for (ApplicationInfo app : all) {
                 if (app == null || app.packageName == null) continue;
 
-                if (self.equals(app.packageName)) {
-                    skippedSelf++;
-                    continue;
-                }
-                if (modulePackages.contains(app.packageName)) {
-                    skippedModules++;
-                    continue;
-                }
+                if (managerSelf.equals(app.packageName)) continue;
+
+                boolean isModulePkg = modulePackages.contains(app.packageName);
+                boolean isSelf = app.packageName.equals(selfPackage);
+
+                // Show this app if:
+                //   • it's not a module at all, OR
+                //   • it's this module AND this module has a launcher activity
+                if (isModulePkg && !(isSelf && allowSelf)) continue;
+
                 filtered.add(app);
             }
 
             try {
-                filtered.sort((a, b) -> {
-                    String la = a.loadLabel(packageManager).toString();
-                    String lb = b.loadLabel(packageManager).toString();
-                    return la.compareToIgnoreCase(lb);
-                });
+                filtered.sort((a, b) -> a.loadLabel(packageManager).toString()
+                        .compareToIgnoreCase(b.loadLabel(packageManager).toString()));
             } catch (Throwable ignored) {}
-
-            logger.d("Listed " + filtered.size() + " hookable apps (skipped "
-                + skippedSelf + " self, " + skippedModules + " module packages)");
 
             return filtered;
         } catch (Exception e) {
-            logger.e("Failed to get installed apps: " + e.getMessage());
+            if (logger != null) logger.e("Failed to get installed apps: " + e.getMessage());
             return new ArrayList<>();
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // ADD MODULE DIALOG
-    // ═════════════════════════════════════════════════════════════════
-
     private void showAddModuleDialog() {
-        if (addModuleDialog != null && addModuleDialog.isShowing()) {
-            addModuleDialog.dismiss();
-        }
+        if (!isAdded() || !viewReady) return;
+        if (addModuleDialog != null && addModuleDialog.isShowing()) addModuleDialog.dismiss();
 
         AlertDialog.Builder builder = new AlertDialog.Builder(requireContext());
         View view = LayoutInflater.from(requireContext())
@@ -685,36 +778,44 @@ public class ModulesFragment extends Fragment {
         selectedApkUri = null;
         selectedApkPath = null;
         selectedApkName = null;
-        tvFilePath.setText("No file selected");
+        if (tvFilePath != null) tvFilePath.setText("No file selected");
 
-        cbAutoDetect.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            etEntry.setEnabled(!isChecked);
-            if (isChecked) etEntry.setText("");
-        });
+        if (cbAutoDetect != null) {
+            cbAutoDetect.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                if (etEntry != null) {
+                    etEntry.setEnabled(!isChecked);
+                    if (isChecked) etEntry.setText("");
+                }
+            });
+        }
 
-        etPackage.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
-                if (etModuleName.getTag() == null || !(Boolean) etModuleName.getTag()) {
-                    String pkgName = s.toString().trim();
-                    if (!pkgName.isEmpty()) {
-                        etModuleName.setText(generateModuleName(pkgName));
+        if (etPackage != null && etModuleName != null) {
+            etPackage.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+                @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                    if (etModuleName.getTag() == null || !(Boolean) etModuleName.getTag()) {
+                        String pkgName = s.toString().trim();
+                        if (!pkgName.isEmpty()) {
+                            etModuleName.setText(generateModuleName(pkgName));
+                        }
                     }
                 }
-            }
-            @Override public void afterTextChanged(Editable s) {}
-        });
+                @Override public void afterTextChanged(Editable s) {}
+            });
 
-        etModuleName.setOnFocusChangeListener((v, hasFocus) -> {
-            if (hasFocus) etModuleName.setTag(true);
-        });
-        etModuleName.setTag(false);
+            etModuleName.setOnFocusChangeListener((v, hasFocus) -> {
+                if (hasFocus) etModuleName.setTag(true);
+            });
+            etModuleName.setTag(false);
+        }
 
-        btnBrowse.setOnClickListener(v -> {
-            if (isFilePickerActive) return;
-            isFilePickerActive = true;
-            openFilePicker();
-        });
+        if (btnBrowse != null) {
+            btnBrowse.setOnClickListener(v -> {
+                if (isFilePickerActive) return;
+                isFilePickerActive = true;
+                openFilePicker();
+            });
+        }
 
         builder.setTitle("Add Module (manual)")
             .setView(view)
@@ -745,6 +846,10 @@ public class ModulesFragment extends Fragment {
     }
 
     private void openFilePicker() {
+        if (!isAdded() || getContext() == null) {
+            isFilePickerActive = false;
+            return;
+        }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("application/vnd.android.package-archive");
@@ -760,21 +865,22 @@ public class ModulesFragment extends Fragment {
         } catch (Exception e) {
             isFilePickerActive = false;
             try {
-                Intent fallbackIntent = new Intent(Intent.ACTION_GET_CONTENT);
-                fallbackIntent.setType("application/vnd.android.package-archive");
-                fallbackIntent.addCategory(Intent.CATEGORY_OPENABLE);
-                filePickerLauncher.launch(Intent.createChooser(fallbackIntent, "Select APK File"));
+                Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+                fallback.setType("application/vnd.android.package-archive");
+                fallback.addCategory(Intent.CATEGORY_OPENABLE);
+                filePickerLauncher.launch(Intent.createChooser(fallback, "Select APK File"));
             } catch (Exception e2) {
                 isFilePickerActive = false;
-                Toast.makeText(requireContext(), "No file picker available", Toast.LENGTH_SHORT).show();
-                logger.e("File picker error: " + e2.getMessage());
+                if (isAdded()) Toast.makeText(requireContext(),
+                    "No file picker available", Toast.LENGTH_SHORT).show();
+                if (logger != null) logger.e("File picker error: " + e2.getMessage());
             }
         }
     }
 
     private void handleSelectedApk(Uri uri) {
         isFilePickerActive = false;
-        if (!isAdded() || getContext() == null) return;
+        if (!isAdded() || getContext() == null || !viewReady) return;
 
         if (addModuleDialog == null || !addModuleDialog.isShowing()) {
             showAddModuleDialog();
@@ -789,41 +895,37 @@ public class ModulesFragment extends Fragment {
                 if (tvFilePath != null) tvFilePath.setText("Selected: " + fileName);
 
                 String filePath = getFilePathFromUri(uri);
-                if (filePath != null) {
-                    selectedApkPath = filePath;
-                } else {
-                    selectedApkPath = copyApkToCache(uri, fileName);
-                }
+                selectedApkPath = (filePath != null) ? filePath : copyApkToCache(uri, fileName);
 
                 if (selectedApkPath != null && etPackage != null
                         && etPackage.getText().toString().isEmpty()) {
                     String pkgName = extractPackageName(selectedApkPath);
-                    if (pkgName != null && !pkgName.isEmpty()) {
-                        etPackage.setText(pkgName);
-                    }
+                    if (pkgName != null && !pkgName.isEmpty()) etPackage.setText(pkgName);
                 }
 
-                Toast.makeText(requireContext(), "File selected: " + fileName, Toast.LENGTH_SHORT).show();
-                logger.i("Selected APK: " + fileName);
-            } else {
-                if (tvFilePath != null) tvFilePath.setText("Unknown file");
+                if (isAdded()) Toast.makeText(requireContext(),
+                    "File selected: " + fileName, Toast.LENGTH_SHORT).show();
+                if (logger != null) logger.i("Selected APK: " + fileName);
+            } else if (tvFilePath != null) {
+                tvFilePath.setText("Unknown file");
             }
         } catch (Exception e) {
-            logger.e("File selection error: " + e.getMessage());
+            if (logger != null) logger.e("File selection error: " + e.getMessage());
             if (tvFilePath != null) tvFilePath.setText("Error: " + e.getMessage());
-            Toast.makeText(requireContext(), "Failed to process file", Toast.LENGTH_SHORT).show();
+            if (isAdded()) Toast.makeText(requireContext(),
+                "Failed to process file", Toast.LENGTH_SHORT).show();
         }
     }
 
     private String getFileNameFromUri(Uri uri) {
         String fileName = null;
         try {
-            if (uri.getScheme().equals("content")) {
+            if (uri.getScheme() != null && uri.getScheme().equals("content")) {
                 try (android.database.Cursor cursor = requireContext().getContentResolver()
                         .query(uri, null, null, null, null)) {
                     if (cursor != null && cursor.moveToFirst()) {
-                        int nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-                        if (nameIndex != -1) fileName = cursor.getString(nameIndex);
+                        int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                        if (idx != -1) fileName = cursor.getString(idx);
                     }
                 }
             }
@@ -836,8 +938,7 @@ public class ModulesFragment extends Fragment {
 
     private String getFilePathFromUri(Uri uri) {
         try {
-            if ("file".equals(uri.getScheme())) return uri.getPath();
-            return null;
+            return "file".equals(uri.getScheme()) ? uri.getPath() : null;
         } catch (Exception e) {
             return null;
         }
@@ -846,28 +947,27 @@ public class ModulesFragment extends Fragment {
     private String copyApkToCache(Uri uri, String fileName) {
         try {
             File cacheDir = requireContext().getCacheDir();
-            File destFile = new File(cacheDir, "selected_module_" + System.currentTimeMillis() + ".apk");
-            try (InputStream inputStream = requireContext().getContentResolver().openInputStream(uri);
-                 FileOutputStream outputStream = new FileOutputStream(destFile)) {
-                byte[] buffer = new byte[8192];
-                int bytesRead;
-                while ((bytesRead = inputStream.read(buffer)) != -1) {
-                    outputStream.write(buffer, 0, bytesRead);
-                }
-                outputStream.flush();
+            File destFile = new File(cacheDir,
+                "selected_module_" + System.currentTimeMillis() + ".apk");
+            try (InputStream in = requireContext().getContentResolver().openInputStream(uri);
+                 FileOutputStream out = new FileOutputStream(destFile)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                out.flush();
             }
             return destFile.getAbsolutePath();
         } catch (Exception e) {
-            logger.e("Failed to copy APK: " + e.getMessage());
+            if (logger != null) logger.e("Failed to copy APK: " + e.getMessage());
             return null;
         }
     }
 
     private String extractPackageName(String apkPath) {
         try {
-            android.content.pm.PackageInfo pkgInfo = packageManager.getPackageArchiveInfo(apkPath, 0);
-            if (pkgInfo != null) return pkgInfo.packageName;
-            return null;
+            android.content.pm.PackageInfo info =
+                packageManager.getPackageArchiveInfo(apkPath, 0);
+            return info != null ? info.packageName : null;
         } catch (Exception e) {
             return null;
         }
@@ -875,18 +975,21 @@ public class ModulesFragment extends Fragment {
 
     private void addModuleFromDialog() {
         if (etPackage == null || etModuleName == null) return;
+        if (moduleLoader == null) return;
 
         String packageName = etPackage.getText().toString().trim();
         String moduleName = etModuleName.getText().toString().trim();
         String entryPoint = etEntry != null ? etEntry.getText().toString().trim() : "";
 
         if (packageName.isEmpty()) {
-            Toast.makeText(requireContext(), "Package name is required", Toast.LENGTH_SHORT).show();
+            if (isAdded()) Toast.makeText(requireContext(),
+                "Package name is required", Toast.LENGTH_SHORT).show();
             return;
         }
         if (moduleName.isEmpty()) moduleName = generateModuleName(packageName);
         if (selectedApkPath == null) {
-            Toast.makeText(requireContext(), "Please select an APK file", Toast.LENGTH_SHORT).show();
+            if (isAdded()) Toast.makeText(requireContext(),
+                "Please select an APK file", Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -902,61 +1005,29 @@ public class ModulesFragment extends Fragment {
             moduleLoader.installModule(module);
             loadModules();
 
-            if (selectedApkPath != null
-                    && selectedApkPath.startsWith(requireContext().getCacheDir().getAbsolutePath())) {
+            if (selectedApkPath.startsWith(requireContext().getCacheDir().getAbsolutePath())) {
                 File cacheFile = new File(selectedApkPath);
                 if (cacheFile.exists()) cacheFile.delete();
             }
 
-            Toast.makeText(requireContext(), "Module added", Toast.LENGTH_SHORT).show();
-            logger.i("Added module: " + module.packageName);
+            if (isAdded()) Toast.makeText(requireContext(),
+                "Module added", Toast.LENGTH_SHORT).show();
+            if (logger != null) logger.i("Added module: " + module.packageName);
 
-            if (addModuleDialog != null && addModuleDialog.isShowing()) {
-                addModuleDialog.dismiss();
-            }
+            if (addModuleDialog != null && addModuleDialog.isShowing()) addModuleDialog.dismiss();
 
             requestModuleRepush("add " + module.packageName);
             announceModuleStateChange(module);
         } catch (Exception e) {
-            Toast.makeText(requireContext(), "Failed to add module: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-            logger.e("Add module error: " + e.getMessage());
+            if (isAdded()) Toast.makeText(requireContext(),
+                "Failed to add module: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            if (logger != null) logger.e("Add module error: " + e.getMessage());
         }
-    }
-
-    public void refresh() {
-        loadModules();
     }
 
     private void showLoading(boolean show) {
         if (progressIndicator != null) {
             progressIndicator.setVisibility(show ? View.VISIBLE : View.GONE);
         }
-    }
-
-    @Override
-    public void onResume() {
-        super.onResume();
-        loadModules();
-        startBackgroundScan();
-    }
-
-    @Override
-    public void onDestroyView() {
-        super.onDestroyView();
-        dismissAllDialogs();
-        addModuleDialog = null;
-        selectAppsDialog = null;
-        confirmDialog = null;
-        isFilePickerActive = false;
-        try { scannerExecutor.shutdownNow(); } catch (Throwable ignored) {}
-    }
-
-    @Override
-    public void onDetach() {
-        super.onDetach();
-        dismissAllDialogs();
-        addModuleDialog = null;
-        selectAppsDialog = null;
-        confirmDialog = null;
     }
 }

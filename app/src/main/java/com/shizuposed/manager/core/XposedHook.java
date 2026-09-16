@@ -9,10 +9,15 @@ import android.os.Process;
 import com.shizuposed.manager.core.compat.AndroidCompat;
 import com.shizuposed.manager.core.compat.HiddenApiBypass;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -25,6 +30,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import dalvik.system.DexClassLoader;
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -41,8 +48,14 @@ public class XposedHook {
     private static final String BASE_DIR        = SHELL_FILES_DIR + "/.syscall_cache";
     private static final String MODULES_DIR     = BASE_DIR + "/modules";
     private static final String HOOKED_DIR      = BASE_DIR + "/hooked";
+    private static final String LIBS_DIR        = SHELL_FILES_DIR + "/libs";
     private static final String STATUS_FILE     = BASE_DIR + "/status";
     private static final String LOG_FILE        = BASE_DIR + "/xposed.log";
+
+    // ─── native library names ─────────────────────────────────────────
+
+    private static final String LIB_AMIRU       = "libamiru.so";
+    private static final String LIB_SHIZUPOSED  = "libshizuposed.so";
 
     // ─── state ────────────────────────────────────────────────────────
 
@@ -53,13 +66,11 @@ public class XposedHook {
 
     private static final Map<String, Object> moduleInstances = new ConcurrentHashMap<>();
 
-    /**
-     * Package names of every module that successfully ran
-     * handleLoadPackage in this process. Written into the hooked
-     * marker file so the manager can answer
-     * LSPosedManager.isModuleActive(...) from a different process.
-     */
     private static final List<String> loadedModuleNames = new ArrayList<>();
+
+    /** Track which native libs loaded, for the marker/diagnostics. */
+    private static volatile boolean amiruLoaded = false;
+    private static volatile boolean shizuposedLoaded = false;
 
     // ─── data holder ──────────────────────────────────────────────────
 
@@ -83,8 +94,6 @@ public class XposedHook {
             myPid = Process.myPid();
             myUid = Process.myUid();
 
-            // Reset per-process state in case the JVM is reused (rare,
-            // but some ROMs recycle the app_process).
             synchronized (loadedModuleNames) {
                 loadedModuleNames.clear();
             }
@@ -125,6 +134,13 @@ public class XposedHook {
                 return;
             }
 
+            // ── Load native engines ───────────────────────────────────
+            // Must happen before HookEngine.ensureBackendInstalled(),
+            // because the backend chain probes isAvailable() at
+            // registration time and both AmiruBackend and NativeBackend
+            // depend on their libraries being loaded.
+            loadNativeLibs();
+
             boolean useBootstrap = (targetUid > 0);
 
             HookEngine.ensureBackendInstalled();
@@ -150,6 +166,65 @@ public class XposedHook {
             try { writeStatus("ERROR", String.valueOf(t.getMessage())); }
             catch (Throwable ignored) {}
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // NATIVE LIBRARY LOADING
+    // ═════════════════════════════════════════════════════════════════
+
+    /**
+     * Load the two native engines from the shell-side lib directory.
+     *
+     *   • libshizuposed.so — the original shared-dispatcher engine.
+     *     Loaded first so its JNI_OnLoad runs before anything that
+     *     might call into it via NativeBridge.
+     *
+     *   • libamiru.so — the per-method stub engine. Optional. If it
+     *     fails to load, AmiruBackend reports unavailable and the
+     *     dispatcher falls through to the other backends.
+     *
+     * Both libraries live in SHELL_FILES_DIR/libs, which was
+     * populated by ShizuPosedService.deployNativeLibsToShellDir()
+     * before this process was launched. The directory is readable
+     * by the shell UID because that is where the service pushed it.
+     *
+     * The path can be overridden via the -Dshizuposed.shell.libs
+     * system property, which ShizuPosedService sets when it builds
+     * the app_process command line. If the property is missing, we
+     * fall back to LIBS_DIR.
+     */
+    private static void loadNativeLibs() {
+        String libDir = System.getProperty("shizuposed.shell.libs", LIBS_DIR);
+        log("Loading native libs from: " + libDir);
+
+        // 1. libshizuposed.so — required for the existing native engine.
+        String szpPath = libDir + "/" + LIB_SHIZUPOSED;
+        try {
+            System.load(szpPath);
+            shizuposedLoaded = true;
+            log("✅ Loaded " + LIB_SHIZUPOSED + " from " + szpPath);
+        } catch (Throwable t) {
+            shizuposedLoaded = false;
+            log("⚠️ " + LIB_SHIZUPOSED + " not loaded: " + t.getMessage());
+            // Not fatal — Pine is still the primary engine. But
+            // NativeBackend will report unavailable.
+        }
+
+        // 2. libamiru.so — optional, provides the per-method stub engine.
+        String amiruPath = libDir + "/" + LIB_AMIRU;
+        try {
+            System.load(amiruPath);
+            amiruLoaded = true;
+            log("✅ Loaded " + LIB_AMIRU + " from " + amiruPath);
+        } catch (Throwable t) {
+            amiruLoaded = false;
+            log("⚠️ " + LIB_AMIRU + " not loaded (optional): " + t.getMessage());
+            // Not fatal — AmiruBackend will decline every hook and
+            // the dispatcher will fall through.
+        }
+
+        log("Native engines: shizuposed=" + shizuposedLoaded
+            + " amiru=" + amiruLoaded);
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -754,9 +829,13 @@ public class XposedHook {
      * answer LSPosedManager.isModuleActive(...) queries from a
      * module's own UI process.
      *
-     * The marker includes the list of module package names that
-     * actually ran handleLoadPackage — that's what tells the manager
-     * "module X has loaded into package Y at least once".
+     * Uses org.json so the writer and the reader agree on the
+     * schema, and so that module package names containing characters
+     * that need escaping are handled correctly.
+     *
+     * The marker now also records which native engines loaded, so
+     * the manager can surface "Amiru active in this process" without
+     * having to query the shell side separately.
      */
     private static void writeHookedMarker(String pkg, int modulesLoaded, String mode) {
         try {
@@ -765,25 +844,28 @@ public class XposedHook {
 
             File f = new File(dir, pkg + ".json");
 
-            // Build the module list JSON array
-            StringBuilder list = new StringBuilder("[");
+            JSONArray list = new JSONArray();
             synchronized (loadedModuleNames) {
-                for (int i = 0; i < loadedModuleNames.size(); i++) {
-                    if (i > 0) list.append(",");
-                    list.append("\"").append(escapeJson(loadedModuleNames.get(i))).append("\"");
+                for (String name : loadedModuleNames) {
+                    if (name != null) list.put(name);
                 }
             }
-            list.append("]");
 
-            String json = "{"
-                + "\"pkg\":\"" + escapeJson(pkg) + "\","
-                + "\"pid\":" + myPid + ","
-                + "\"uid\":" + myUid + ","
-                + "\"modules\":" + modulesLoaded + ","
-                + "\"mode\":\"" + escapeJson(mode) + "\","
-                + "\"ts\":" + System.currentTimeMillis() + ","
-                + "\"moduleList\":" + list
-                + "}";
+            JSONObject engines = new JSONObject();
+            engines.put("shizuposed", shizuposedLoaded);
+            engines.put("amiru", amiruLoaded);
+
+            JSONObject obj = new JSONObject();
+            obj.put("pkg", pkg);
+            obj.put("pid", myPid);
+            obj.put("uid", myUid);
+            obj.put("modules", modulesLoaded);
+            obj.put("mode", mode == null ? "" : mode);
+            obj.put("ts", System.currentTimeMillis());
+            obj.put("moduleList", list);
+            obj.put("engines", engines);
+
+            String json = obj.toString();
 
             try (FileWriter w = new FileWriter(f, false)) {
                 w.write(json);
@@ -792,15 +874,12 @@ public class XposedHook {
 
             log("Wrote hooked marker: " + f.getAbsolutePath()
                 + " (" + modulesLoaded + " modules, mode=" + mode
+                + ", shizuposed=" + shizuposedLoaded
+                + ", amiru=" + amiruLoaded
                 + ", list=" + list + ")");
         } catch (Throwable t) {
             log("writeHookedMarker failed: " + t.getMessage());
         }
-    }
-
-    private static String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -871,7 +950,7 @@ public class XposedHook {
             if (app != null && app.getCacheDir() != null) {
                 optDir = app.getCacheDir().getAbsolutePath();
             } else {
-                optDir = "/data/local/tmp/pine-opt";
+                optDir = BASE_DIR + "/dexopt/" + info.packageName;
                 new File(optDir).mkdirs();
             }
 
@@ -882,6 +961,9 @@ public class XposedHook {
                 appLoader);
 
             String entry = info.xposedInit;
+            if (entry == null || entry.isEmpty()) {
+                entry = readXposedInitFromZip(info.cachedDexPath);
+            }
             if (entry == null || entry.isEmpty()) {
                 entry = guessEntryPoint(loader, info.packageName);
             }
@@ -921,7 +1003,6 @@ public class XposedHook {
             if (handled) {
                 moduleInstances.put(info.packageName, instance);
 
-                // Track this module name for the hooked marker
                 synchronized (loadedModuleNames) {
                     if (!loadedModuleNames.contains(info.packageName)) {
                         loadedModuleNames.add(info.packageName);
@@ -941,6 +1022,32 @@ public class XposedHook {
             t.printStackTrace();
             return false;
         }
+    }
+
+    /**
+     * Read assets/xposed_init from the module's cached APK. This is
+     * the standard Xposed entry-point declaration. Handles modules
+     * whose entry class is not one of the eight conventionally-named
+     * candidates in guessEntryPoint().
+     */
+    private static String readXposedInitFromZip(String dexPath) {
+        if (dexPath == null) return null;
+        File f = new File(dexPath);
+        if (!f.exists()) return null;
+        try (ZipFile zip = new ZipFile(f)) {
+            ZipEntry entry = zip.getEntry("assets/xposed_init");
+            if (entry == null) return null;
+            try (InputStream is = zip.getInputStream(entry);
+                 BufferedReader r = new BufferedReader(new InputStreamReader(is))) {
+                String line = r.readLine();
+                if (line != null && !line.isEmpty()) {
+                    return line.trim();
+                }
+            }
+        } catch (Throwable t) {
+            log("readXposedInitFromZip(" + dexPath + ") failed: " + t.getMessage());
+        }
+        return null;
     }
 
     private static void tryEnableModuleDebug(Class<?> moduleClass) {
@@ -1063,45 +1170,30 @@ public class XposedHook {
 
     private static ModuleInfo parseModule(String json) {
         try {
+            JSONObject o = new JSONObject(json);
             ModuleInfo i = new ModuleInfo();
-            i.packageName   = jval(json, "packageName");
-            i.name          = jval(json, "name");
-            i.xposedInit    = jval(json, "xposedInit");
-            i.cachedDexPath = jval(json, "cachedDexPath");
-            i.enabled       = "true".equals(jval(json, "enabled"));
-            i.hookAllApps   = "true".equals(jval(json, "hookAllApps"));
-            i.hookSystemApps= "true".equals(jval(json, "hookSystemApps"));
+            i.packageName    = o.optString("packageName", null);
+            i.name           = o.optString("name", null);
+            i.xposedInit     = o.optString("xposedInit", null);
+            i.cachedDexPath  = o.optString("cachedDexPath", null);
+            i.enabled        = o.optBoolean("enabled", false);
+            i.hookAllApps    = o.optBoolean("hookAllApps", false);
+            i.hookSystemApps = o.optBoolean("hookSystemApps", false);
 
-            String apps = jval(json, "hookedApps");
-            if (apps != null && !apps.isEmpty() && !"null".equals(apps)) {
-                apps = apps.replace("[", " ").replace("]", " ").replace("\"", "");
-                for (String a : apps.split(",")) {
-                    String t = a.trim();
-                    if (!t.isEmpty()) i.hookedApps.add(t);
+            JSONArray apps = o.optJSONArray("hookedApps");
+            if (apps != null) {
+                for (int k = 0; k < apps.length(); k++) {
+                    String a = apps.optString(k, null);
+                    if (a != null && !a.isEmpty()) i.hookedApps.add(a);
                 }
             }
+
+            if (i.packageName == null || i.packageName.isEmpty()) return null;
             return i;
         } catch (Throwable t) {
+            log("parseModule failed: " + t.getMessage());
             return null;
         }
-    }
-
-    private static String jval(String json, String key) {
-        String needle = "\"" + key + "\":";
-        int s = json.indexOf(needle);
-        if (s < 0) return "";
-        s += needle.length();
-        while (s < json.length() && Character.isWhitespace(json.charAt(s))) s++;
-        if (s >= json.length()) return "";
-        char first = json.charAt(s);
-        if (first == '"') {
-            int e = json.indexOf('"', s + 1);
-            return e < 0 ? "" : json.substring(s + 1, e);
-        }
-        int e = json.indexOf(',', s);
-        if (e < 0) e = json.indexOf('}', s);
-        if (e < 0) return "";
-        return json.substring(s, e).trim();
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -1113,6 +1205,7 @@ public class XposedHook {
             new File(BASE_DIR).mkdirs();
             new File(MODULES_DIR).mkdirs();
             new File(HOOKED_DIR).mkdirs();
+            new File(LIBS_DIR).mkdirs();
         } catch (Throwable ignored) {}
     }
 
