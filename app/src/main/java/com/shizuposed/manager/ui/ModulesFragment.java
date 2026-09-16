@@ -463,7 +463,7 @@ public class ModulesFragment extends Fragment {
         if (module == null || module.packageName == null) return;
         if (!isAdded()) return;
         ModuleDetailSheet sheet = ModuleDetailSheet.newInstance(module.packageName);
-        sheet.show(getParentFragmentManager(), "module_detail");
+        sheet.show(getChildFragmentManager(), "module_detail");
     }
 
     public void onModuleUpdated(ModuleInfo updated) {
