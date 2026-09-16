@@ -25,6 +25,7 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizuPosedManagerApp;
+import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.adapter.HookedProcessAdapter;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.core.ProcessMonitor;
@@ -52,6 +53,7 @@ public class HomeFragment extends Fragment {
     private TextView tvFrameworkVersion, tvApiVersion;
     private TextView tvShellPackage, tvShellUid;
     private TextView tvSystemVersion, tvDevice, tvSystemAbi;
+    private TextView tvAppProcessStatus;
 
     private Logger logger;
     private ProcessMonitor processMonitor;
@@ -118,6 +120,7 @@ public class HomeFragment extends Fragment {
         tvFrameworkVersion = null; tvApiVersion = null;
         tvShellPackage = null; tvShellUid = null;
         tvSystemVersion = null; tvDevice = null; tvSystemAbi = null;
+        tvAppProcessStatus = null;
     }
 
     @Override
@@ -164,6 +167,7 @@ public class HomeFragment extends Fragment {
         tvSystemVersion    = view.findViewById(R.id.tvSystemVersion);
         tvDevice           = view.findViewById(R.id.tvDevice);
         tvSystemAbi        = view.findViewById(R.id.tvSystemAbi);
+        tvAppProcessStatus = view.findViewById(R.id.tvAppProcessStatus);
     }
 
     private void populateFrameworkInfo() {
@@ -260,6 +264,7 @@ public class HomeFragment extends Fragment {
             || (app != null && app.isServiceAutoStarted());
 
         updateStatus(shizukuAuthorized, serviceRunning);
+        updateAppProcessStatus();
 
         if (tvTotalApps != null) {
             tvTotalApps.setText(String.valueOf(getTotalInstalledApps()));
@@ -295,6 +300,29 @@ public class HomeFragment extends Fragment {
             + ", Apps: " + getTotalInstalledApps()
             + ", Shown processes: " + hookedProcesses.size()
             + ", Service: " + serviceRunning);
+    }
+
+    private void updateAppProcessStatus() {
+        if (!viewReady || tvAppProcessStatus == null || !isAdded()) return;
+
+        ShizukuHelper helper = ShizukuHelper.getInstance(requireContext());
+        if (!helper.isAuthorized()) {
+            tvAppProcessStatus.setText("Needs Shizuku permission");
+            tvAppProcessStatus.setTextColor(com.google.android.material.color.MaterialColors
+                .getColor(tvAppProcessStatus, com.google.android.material.R.attr.colorError));
+            return;
+        }
+
+        String binary = helper.getAppProcessBinary();
+        if (binary == null) {
+            tvAppProcessStatus.setText("Unavailable on this ROM\nApp launch disabled");
+            tvAppProcessStatus.setTextColor(com.google.android.material.color.MaterialColors
+                .getColor(tvAppProcessStatus, com.google.android.material.R.attr.colorError));
+        } else {
+            tvAppProcessStatus.setText("Ready (" + binary + ")");
+            tvAppProcessStatus.setTextColor(com.google.android.material.color.MaterialColors
+                .getColor(tvAppProcessStatus, com.google.android.material.R.attr.colorPrimary));
+        }
     }
 
     private void updateStatus(boolean shizukuAuthorized, boolean serviceRunning) {

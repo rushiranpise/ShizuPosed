@@ -232,6 +232,13 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                         Toast.LENGTH_LONG).show();
                 return;
             }
+            String binary = helper.getAppProcessBinary();
+            if (binary == null) {
+                Toast.makeText(requireContext(),
+                        "This ROM does not expose app_process; scoped launch is unavailable",
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
 
             Intent service = new Intent(requireContext(), ShizuPosedService.class);
             service.setAction(ShizuPosedService.ACTION_LAUNCH_APP);

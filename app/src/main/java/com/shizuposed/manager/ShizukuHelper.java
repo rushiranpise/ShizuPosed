@@ -78,7 +78,11 @@ public class ShizukuHelper {
     private final AtomicBoolean grantToastShown = new AtomicBoolean(false);
 
     private static final String[] APP_PROCESS_CANDIDATES = {
-        "app_process64", "app_process", "app_process32",
+        "/system/bin/app_process64",
+        "/system/bin/app_process",
+        "/system/bin/app_process32",
+        "/apex/com.android.runtime/bin/app_process64",
+        "/apex/com.android.runtime/bin/app_process",
     };
 
     private volatile String cachedAppProcessBinary = null;
@@ -540,19 +544,13 @@ public class ShizukuHelper {
 
     private boolean probeAppProcess(String name) {
         try {
-            String cmd = "command -v " + name + " >/dev/null 2>&1 && "
-                       + name + " 2>&1 | head -1";
+            String command = name.startsWith("/") ? "[ -x " + name + " ]" : "command -v " + name;
+            String cmd = command + " >/dev/null 2>&1 && printf '__APP_PROCESS_FOUND__'";
             ShellUtils.CommandResult r = executeCommand(cmd);
             if (r == null) return false;
-            String out = r.getStdoutString();
-            String err = r.getStderrString();
-            boolean found = (out != null && !out.isEmpty())
-                         || (err != null && err.contains(name));
-            if (!found) return false;
-            String probe = (out == null ? "" : out) + " " + (err == null ? "" : err);
-            if (probe.contains("Permission denied")) return false;
-            if (probe.contains("not found")) return false;
-            return true;
+            boolean found = r.isSuccess()
+                         && r.getStdoutString().contains("__APP_PROCESS_FOUND__");
+            return found;
         } catch (Throwable t) {
             return false;
         }
